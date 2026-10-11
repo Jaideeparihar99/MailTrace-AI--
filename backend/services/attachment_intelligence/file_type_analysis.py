@@ -1053,7 +1053,7 @@ def _soc_type_postprocess(result: FileTypeAnalysisResult, detected: Optional[Dic
 
     File type analysis establishes file characteristics; it does not prove maliciousness.
     """
-    result.metadata["malware_confirmed"] = False
+    result.metadata["malware_confirmed"] = None
     result.metadata["analysis_scope"] = "static_file_type_and_structure"
     result.metadata["identity_confidence"] = 0.0 if not detected else 0.99
     result.metadata["inferred_mime_type"] = detected.get("mime_type") if detected else _inferred_text_mime(data)
@@ -1135,7 +1135,7 @@ def _soc_type_postprocess(result: FileTypeAnalysisResult, detected: Optional[Dic
     }
 
     if detected and detected.get("executable"):
-        result.metadata["malware_confirmed"] = False
+        result.metadata["malware_confirmed"] = None
         result.metadata["maliciousness_basis"] = "executable_content_or_executable_format_detected; malware_not_confirmed_by_file_type_only"
     elif detected:
         result.metadata["maliciousness_basis"] = "file_type_and_structure_only"
@@ -1175,7 +1175,7 @@ def _soc_type_postprocess(result: FileTypeAnalysisResult, detected: Optional[Dic
         "semantic_mime_type": semantic_mime,
         "extension": extension,
         "mime_type": result.mime_type,
-        "malware_confirmed": False,
+        "malware_confirmed": None,
         "semantic_extension_consistent": result.metadata.get("semantic_extension_consistent"),
         "mime_consistency": result.metadata.get("mime_consistency"),
         "identity_conflict": result.metadata.get("identity_conflict", False),
@@ -1187,15 +1187,18 @@ def _soc_type_postprocess(result: FileTypeAnalysisResult, detected: Optional[Dic
 
 
 def analyze_file_type(
-    file_path: Union[str, Path],
+    file_path: Optional[Union[str, Path]] = None,
     filename: Optional[str] = None,
     header: Optional[bytes] = None,
+    file_size: Optional[int] = None,
 ) -> FileTypeAnalysisResult:
     """Run bounded static file-type intelligence."""
-    path = Path(file_path)
-    display_name = filename or path.name
+    path = Path(file_path) if file_path is not None else None
+    if path is None and (header is None or file_size is None):
+        raise ValueError("Byte-based file-type analysis requires header bytes and the full file size.")
+    display_name = filename or (path.name if path is not None else "attachment.bin")
     extension = get_extension(display_name)
-    size = path.stat().st_size
+    size = max(0, int(file_size)) if file_size is not None else path.stat().st_size
     data = header if header is not None else _read_bounded(path, MAX_HEADER_READ)
 
     detected = detect_file_signature(data)

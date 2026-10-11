@@ -249,7 +249,14 @@ class PrivacyGovernanceEngine:
             reason = "forensic hold protects investigative material"
         elif now >= expires:
             action = RetentionAction.ELIGIBLE_FOR_PURGE.value
-            reason = "retention period elapsed"
+            if policy.purge_derived_views and policy.purge_raw_evidence:
+                reason = "retention elapsed; derived views and raw evidence are eligible for policy-controlled purge"
+            elif policy.purge_derived_views:
+                reason = "retention elapsed; derived views are eligible for purge and raw evidence remains retained"
+            elif policy.purge_raw_evidence:
+                reason = "retention elapsed; raw evidence is eligible for purge and derived views remain retained"
+            else:
+                reason = "retention elapsed; this policy has no automatic purge actions enabled"
         else:
             action = RetentionAction.RETAIN.value
             reason = "retention period active"

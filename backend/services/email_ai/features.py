@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 import re
@@ -3890,3 +3890,5 @@ def reconstruct_attack_chain(
         ),
 
     }
+
+

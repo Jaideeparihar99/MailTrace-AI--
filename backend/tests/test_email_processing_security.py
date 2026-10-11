@@ -199,6 +199,7 @@ class EmailProcessingSecurityTests(unittest.TestCase):
             with patch.object(database, "DATABASE_PATH", Path(root) / "test.db"):
                 database.initialize_database()
                 database.initialize_email_webhook_events()
+                database.initialize_email_alerts()
                 with patch.dict(os.environ, {"MAILTRACE_WEBHOOK_SECRET": secret}):
                     with patch.object(main, "_analyze_email", side_effect=capture) as pipeline:
                         client = TestClient(main.app)

@@ -249,14 +249,66 @@ def _attachment_signals(email: Mapping[str, Any]) -> List[Signal]:
         return []
     dangerous_ext = {".exe",".scr",".js",".vbs",".bat",".cmd",".ps1",".msi",".dll",".hta",".lnk",".iso"}
     dangerous = 0
+    masqueraded = 0
+    unscanned = 0
+    scan_unverified = 0
+    confirmed_malware = 0
     for item in attachments:
-        name = _lower(item.get("filename") if isinstance(item, Mapping) else item)
-        dangerous += any(name.endswith(ext) for ext in dangerous_ext)
+        if not isinstance(item, Mapping):
+            name = _lower(item)
+            file_type = {}
+        else:
+            name = _lower(item.get("filename"))
+            scan = item.get("malware_scan")
+            if not isinstance(scan, Mapping):
+                scan = {}
+            scan_status = _upper(scan.get("status"))
+            confirmed_malware += int(scan_status in {"INFECTED", "MALICIOUS"})
+            scan_unverified += int(scan_status not in {"CLEAN", "INFECTED", "MALICIOUS"})
+            file_type = item.get("file_type_intelligence")
+            if not isinstance(file_type, Mapping):
+                file_type = {}
+            if item.get("analysis_status") != "STATIC_ANALYSIS_COMPLETE":
+                unscanned += 1
+        detected_category = _upper(file_type.get("detected_category"))
+        detected_type = _upper(file_type.get("detected_type"))
+        executable_detected = bool(
+            file_type.get("metadata", {}).get("executable_detected")
+            if isinstance(file_type.get("metadata"), Mapping)
+            else False
+        ) or detected_category == "EXECUTABLE"
+        risky_extension = any(name.endswith(ext) for ext in dangerous_ext)
+        dangerous += int(risky_extension or executable_detected)
+        masqueraded += int(
+            executable_detected
+            and name.rsplit(".", 1)[-1] not in {"exe", "scr", "dll", "sys", "ocx", "cpl"}
+        )
+    if confirmed_malware:
+        return [_make_signal("malware_delivery", "attachment_malware_confirmed", 100, .99,
+                             f"ClamAV reported malware in {confirmed_malware} attachment(s). Treat the reported file(s) as malicious and preserve the scanner signature as evidence.",
+                             True, "clamav_malware_scan", .99)]
     if dangerous:
         return [_make_signal("malware_delivery","attachment_delivery_risk",
-                             min(100,86+dangerous*6),min(.98,.84+dangerous*.05),
-                             f"{len(attachments)} attachment(s); {dangerous} dangerous executable/script attachment(s).",
-                             True,"attachment_intelligence",.88)]
+                             min(96,78+dangerous*5+masqueraded*5),min(.82,.68+dangerous*.04),
+                             f"{len(attachments)} attachment(s); {dangerous} executable-format or script-capable attachment(s), {masqueraded} with a potentially misleading extension. Executable format alone does not confirm malware.",
+                             True,"attachment_intelligence",.82)]
+    if any(
+        isinstance(item, Mapping)
+        and isinstance(item.get("file_type_intelligence"), Mapping)
+        and item["file_type_intelligence"].get("metadata", {}).get("semantic_extension_consistent") is False
+        for item in attachments
+    ):
+        return [_make_signal("malware_delivery","attachment_type_mismatch",68,.72,
+                             f"{len(attachments)} attachment(s); file content and filename extension do not consistently match.",
+                             True,"attachment_intelligence",.70)]
+    if unscanned:
+        return [_make_signal("attachment","attachment_scan_coverage_limited",52,.50,
+                             f"{len(attachments)} attachment(s); static analysis is incomplete for {unscanned}. Malware scanning or detonation may be unavailable or over its processing limit.",
+                             False,"attachment_intelligence",.45)]
+    if scan_unverified:
+        return [_make_signal("attachment","attachment_malware_scan_unverified",52,.50,
+                             f"{len(attachments)} attachment(s); malware scan did not return a clean or infected verdict for {scan_unverified}. Do not treat this as a clean scan.",
+                             False,"attachment_intelligence",.45)]
     return [_make_signal("attachment","attachment_presence",48,.58,
                          f"{len(attachments)} attachment(s) present.",False,"attachment_intelligence",.55)]
 

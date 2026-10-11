@@ -1,7 +1,24 @@
 ﻿from email import policy
 from email.parser import BytesParser
 from email.message import Message
+import hashlib
 import re
+import time
+
+from services.attachment_intelligence.clamav_scanner import is_configured as clamav_is_configured
+from services.attachment_intelligence.clamav_scanner import scan_attachment as scan_attachment_with_clamav
+from services.attachment_intelligence.file_type_analysis import (
+    MAX_HEADER_READ,
+    analyze_file_type,
+)
+
+
+MAX_STATIC_ATTACHMENT_ANALYSES = 50
+MAX_EMAIL_ATTACHMENTS_REPORTED = 200
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024
+MAX_MALWARE_SCAN_ATTACHMENTS = 10
+MALWARE_SCAN_BUDGET_SECONDS = 5.0
 
 
 
@@ -427,6 +444,11 @@ def extract_urls(text: str):
 def extract_attachments(message: Message):
 
     attachments = []
+    omitted_count = 0
+    processed_bytes = 0
+    malware_scan_deadline = time.monotonic() + MALWARE_SCAN_BUDGET_SECONDS
+    malware_scan_count = 0
+    malware_scanner_configured = clamav_is_configured()
 
 
     for part in message.walk():
@@ -435,29 +457,147 @@ def extract_attachments(message: Message):
 
 
         if filename:
+            if len(attachments) >= MAX_EMAIL_ATTACHMENTS_REPORTED:
+                omitted_count += 1
+                continue
+            safe_filename = str(filename).replace("\\", "/").split("/")[-1]
+            safe_filename = "".join(
+                char for char in safe_filename
+                if ord(char) >= 32 and ord(char) != 127
+            )[:255] or "unnamed-attachment"
+            raw_payload = part.get_payload()
+            raw_payload_length = len(raw_payload) if isinstance(raw_payload, (str, bytes)) else 0
+            payload_limit_status = None
+            payload_decode_failed = False
+            if raw_payload_length > MAX_ATTACHMENT_BYTES:
+                payload = b""
+                payload_limit_status = "PAYLOAD_SIZE_LIMIT_EXCEEDED"
+            elif processed_bytes >= MAX_TOTAL_ATTACHMENT_BYTES:
+                payload = b""
+                payload_limit_status = "TOTAL_ATTACHMENT_SIZE_LIMIT_EXCEEDED"
+            else:
+                try:
+                    decoded_payload = part.get_payload(decode=True)
+                    if isinstance(decoded_payload, bytes):
+                        payload = decoded_payload
+                    elif decoded_payload is None and raw_payload in (None, "", b""):
+                        payload = b""
+                    else:
+                        payload = b""
+                        payload_decode_failed = True
+                except Exception:
+                    payload = b""
+                    payload_decode_failed = True
+                if len(payload) > MAX_ATTACHMENT_BYTES:
+                    payload = b""
+                    payload_limit_status = "PAYLOAD_SIZE_LIMIT_EXCEEDED"
+                elif processed_bytes + len(payload) > MAX_TOTAL_ATTACHMENT_BYTES:
+                    payload = b""
+                    payload_limit_status = "TOTAL_ATTACHMENT_SIZE_LIMIT_EXCEEDED"
+                else:
+                    processed_bytes += len(payload)
+            if payload_decode_failed:
+                payload_limit_status = "PAYLOAD_DECODE_FAILED"
 
-            payload = part.get_payload(
-                decode=True
-            )
+            item = {
+                "filename": safe_filename,
+                "content_type": part.get_content_type(),
+                "size": None if payload_limit_status else len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest() if not payload_limit_status else None,
+                "analysis_status": payload_limit_status or "NOT_ANALYZED_ATTACHMENT_LIMIT",
+                "malware_scan": {
+                    "status": (
+                        "NOT_CONFIGURED"
+                        if not malware_scanner_configured
+                        else "NOT_SCANNED_INPUT_UNAVAILABLE"
+                        if payload_limit_status
+                        else "NOT_SCANNED_PENDING"
+                    ),
+                    "malware_confirmed": None,
+                    "reason": (
+                        "No malware scanner is configured; static metadata is not a malware verdict."
+                        if not malware_scanner_configured
+                        else "Attachment bytes were unavailable for scanning."
+                        if payload_limit_status
+                        else "ClamAV scan has not completed."
+                    ),
+                },
+                "detonation": {"status": "NOT_CONFIGURED", "content_executed": False},
+            }
 
+            if not payload_limit_status and len(attachments) < MAX_STATIC_ATTACHMENT_ANALYSES:
+                try:
+                    type_result = analyze_file_type(
+                        filename=safe_filename,
+                        header=payload[:MAX_HEADER_READ],
+                        file_size=len(payload),
+                    )
+                    type_metadata = type_result.metadata or {}
+                    item["analysis_status"] = "STATIC_ANALYSIS_COMPLETE"
+                    item["file_type_intelligence"] = {
+                        "analysis_version": type_result.analysis_version,
+                        "detected_type": type_result.detected_type,
+                        "detected_category": type_result.detected_category,
+                        "mime_type": type_result.mime_type,
+                        "extension": type_result.extension,
+                        "risk_score": type_result.risk_score,
+                        "findings": [finding.to_dict() for finding in type_result.findings[:20]],
+                        "metadata": {
+                            key: type_metadata[key]
+                            for key in (
+                                "executable_detected",
+                                "archive_detected",
+                                "semantic_file_type",
+                                "semantic_mime_type",
+                                "semantic_extension_consistent",
+                                "mime_consistency",
+                                "identity_conflict",
+                                "identity_confidence",
+                                "detection_basis",
+                                "signature_offset",
+                                "container_subtype",
+                                "embedded_markers",
+                            )
+                            if key in type_metadata
+                        },
+                    }
+                except Exception as error:
+                    item["analysis_status"] = "STATIC_ANALYSIS_FAILED"
+                    item["analysis_error_type"] = type(error).__name__
 
-            size = (
-                len(payload)
-                if payload
-                else 0
-            )
+            if malware_scanner_configured and not payload_limit_status:
+                if malware_scan_count >= MAX_MALWARE_SCAN_ATTACHMENTS:
+                    item["malware_scan"] = {
+                        "status": "NOT_SCANNED_ATTACHMENT_LIMIT",
+                        "malware_confirmed": None,
+                        "engine": "ClamAV",
+                    }
+                elif time.monotonic() >= malware_scan_deadline:
+                    item["malware_scan"] = {
+                        "status": "NOT_SCANNED_TIME_BUDGET",
+                        "malware_confirmed": None,
+                        "engine": "ClamAV",
+                    }
+                else:
+                    item["malware_scan"] = scan_attachment_with_clamav(
+                        payload,
+                        deadline=malware_scan_deadline,
+                    )
+                    malware_scan_count += 1
 
+            attachments.append(item)
 
-            attachments.append({
-
-                "filename": filename,
-
-                "content_type":
-                    part.get_content_type(),
-
-                "size": size
-
-            })
+    if omitted_count:
+        attachments.append({
+            "filename": "[additional attachments omitted]",
+            "analysis_status": "ATTACHMENT_COUNT_LIMIT_EXCEEDED",
+            "omitted_count": omitted_count,
+            "malware_scan": {
+                "status": "NOT_CONFIGURED" if not malware_scanner_configured else "NOT_SCANNED_ATTACHMENT_COUNT_LIMIT",
+                "malware_confirmed": None,
+            },
+            "detonation": {"status": "NOT_CONFIGURED", "content_executed": False},
+        })
 
 
     return attachments

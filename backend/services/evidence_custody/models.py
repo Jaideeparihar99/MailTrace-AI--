@@ -92,6 +92,7 @@ class VerificationResult:
     expected_sha512: str | None
 
     issues: list[str] = field(default_factory=list)
+    preservation_copy_purged: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

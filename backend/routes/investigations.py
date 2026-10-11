@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from database.database import (
     get_all_investigation_summaries,
@@ -15,11 +15,14 @@ router = APIRouter(
 
 
 @router.get("")
-def list_investigations():
+def list_investigations(request: Request):
 
     try:
 
-        investigations = get_all_investigation_summaries()
+        principal = getattr(request.state, "principal", None)
+        investigations = get_all_investigation_summaries(
+            principal.tenant_id if principal else None
+        )
 
         return {
             "success": True,
@@ -37,13 +40,16 @@ def list_investigations():
 
 @router.get("/{investigation_id}")
 def get_single_investigation(
-    investigation_id: str
+    investigation_id: str,
+    request: Request,
 ):
 
     try:
 
+        principal = getattr(request.state, "principal", None)
         investigation = get_investigation(
-            investigation_id
+            investigation_id,
+            principal.tenant_id if principal else None,
         )
 
         if investigation is None:

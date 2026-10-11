@@ -35,6 +35,8 @@ class EvidenceState(str, Enum):
     SEALED = "SEALED"
     IN_CUSTODY = "IN_CUSTODY"
     ARCHIVED = "ARCHIVED"
+    PURGE_PENDING = "PURGE_PENDING"
+    PURGED = "PURGED"
     COMPROMISED = "COMPROMISED"
 
 
@@ -48,6 +50,9 @@ class CustodyEventType(str, Enum):
     EXPORTED = "EXPORTED"
     ARCHIVED = "ARCHIVED"
     INTEGRITY_FAILURE = "INTEGRITY_FAILURE"
+    PURGE_REQUESTED = "PURGE_REQUESTED"
+    PRESERVATION_PURGED = "PRESERVATION_PURGED"
+    PURGE_FAILED = "PURGE_FAILED"
 
 
 ALLOWED_TRANSITIONS = {
@@ -78,8 +83,16 @@ ALLOWED_TRANSITIONS = {
         "VERIFY",
         "ACCESS",
         "COMPROMISE",
+        "PURGE",
     },
     "COMPROMISED": {
+        "VERIFY",
+    },
+    "PURGE_PENDING": {
+        "PURGE",
+        "VERIFY",
+    },
+    "PURGED": {
         "VERIFY",
     },
 }
@@ -93,6 +106,8 @@ EVENT_TO_STATE = {
     "RECEIVED": "IN_CUSTODY",
     "ARCHIVED": "ARCHIVED",
     "INTEGRITY_FAILURE": "COMPROMISED",
+    "PURGE_REQUESTED": "PURGE_PENDING",
+    "PRESERVATION_PURGED": "PURGED",
 }
 
 SEVERITY_INFO = "INFO"
@@ -116,3 +131,5 @@ FORBIDDEN_EVIDENCE_ID_VALUES = frozenset({
     ".",
     "..",
 })
+
+

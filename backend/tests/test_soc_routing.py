@@ -10,10 +10,11 @@ def test_soc_routing():
     db.DATABASE_PATH = temp_db
     try:
         db.initialize_database()
+        db.initialize_case_claims()
         db.initialize_soc_routing()
         conn = db.get_connection()
-        conn.execute("INSERT INTO cases(case_id,title,status) VALUES(?,?,?)", ("CASE-REGION", "Regional", "OPEN"))
-        conn.execute("INSERT INTO cases(case_id,title,status) VALUES(?,?,?)", ("CASE-FALLBACK", "Fallback", "OPEN"))
+        conn.execute("INSERT INTO cases(case_id,tenant_id,title,status) VALUES(?,?,?,?)", ("CASE-REGION", "tenant-test", "Regional", "OPEN"))
+        conn.execute("INSERT INTO cases(case_id,tenant_id,title,status) VALUES(?,?,?,?)", ("CASE-FALLBACK", "tenant-test", "Fallback", "OPEN"))
         conn.commit()
         conn.close()
 
@@ -29,10 +30,11 @@ def test_soc_routing():
         fallback = db.route_case_to_soc("CASE-FALLBACK", "tenant-test", "employee-without-region")
         assert fallback["queue_id"] == "CENTRAL"
         assert fallback["region_key"] == "CENTRAL"
-        assert fallback["status"] == "FALLBACK"
+        assert fallback["status"] == "QUEUED"
+        assert fallback["assigned_analyst"] is None
 
         print("Regional routing: PASS")
-        print("Central fallback: PASS")
+        print("Central fallback remains queued when no central analyst is eligible: PASS")
         print("SOC routing tests: PASS")
     finally:
         db.DATABASE_PATH = original

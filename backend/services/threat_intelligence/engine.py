@@ -197,6 +197,7 @@ def fetch_threatfox(days: int = 1) -> dict[str, Any]:
             "count": 0,
             "data": [],
             "error": str(error),
+            "error_type": type(error).__name__,
         }
 
 
@@ -260,6 +261,7 @@ def search_threatfox(ioc: str) -> dict[str, Any]:
             "count": 0,
             "data": [],
             "error": str(error),
+            "error_type": type(error).__name__,
         }
 
 
@@ -336,6 +338,7 @@ def fetch_urlhaus_recent() -> dict[str, Any]:
             "count": 0,
             "data": [],
             "error": str(error),
+            "error_type": type(error).__name__,
         }
 
 

@@ -1,4 +1,4 @@
-"""
+﻿"""
 MailTrace-AI - Rendered-Link Deception & Visual URL Mismatch Intelligence
 
 Purpose:
@@ -651,3 +651,5 @@ __all__ = [
     "analyze_link_deception",
     "analyze_link_deception_to_dict",
 ]
+
+

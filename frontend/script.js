@@ -204,6 +204,18 @@
                     meta.textContent = `${item.case_id} · ${item.alert_status || "NEW"}`;
                     button.appendChild(meta);
                 }
+                const gatewayStatus = String(item.gateway_action_status || "UNKNOWN").toUpperCase();
+                const gatewayLabels = {
+                    APPLIED: `Gateway confirmed ${String(item.recommended_action || "policy action").toLowerCase()}`,
+                    FAILED: "Gateway action failed — operations follow-up required",
+                    PENDING_CONFIRMATION: "Gateway action awaiting confirmation",
+                    OBSERVED: "Gateway observed the policy recommendation",
+                    MONITOR_ONLY: "Monitoring mode — no gateway action confirmed"
+                };
+                const gatewayMeta = document.createElement("small");
+                gatewayMeta.className = "flagged-item-case";
+                gatewayMeta.textContent = gatewayLabels[gatewayStatus] || "Gateway action status unavailable";
+                button.appendChild(gatewayMeta);
                 const whyRisky = item.user_notification?.why_risky;
                 if (Array.isArray(whyRisky) && whyRisky.length) {
                     const guidance = document.createElement("small");
@@ -2572,6 +2584,33 @@ const existingResult =
                         <p class="attachment-evidence-intro">File properties returned by the analysis pipeline. A listed attachment has not been declared safe unless a separate scan result says so.</p>
                         <div class="attachment-evidence-list">
                             ${attachments.map((attachment, index) => `
+                                ${(() => {
+                                    const staticResult = attachment.file_type_intelligence || {};
+                                    const staticFindings = Array.isArray(staticResult.findings) ? staticResult.findings : [];
+                                    const statusLabels = {
+                                        STATIC_ANALYSIS_COMPLETE: "STATIC TRIAGE · NO MALWARE SCAN",
+                                        STATIC_ANALYSIS_FAILED: "STATIC TRIAGE FAILED",
+                                        NOT_ANALYZED_ATTACHMENT_LIMIT: "STATIC TRIAGE LIMIT",
+                                        PAYLOAD_SIZE_LIMIT_EXCEEDED: "SIZE LIMIT · NOT ANALYZED",
+                                        TOTAL_ATTACHMENT_SIZE_LIMIT_EXCEEDED: "MESSAGE SIZE LIMIT · NOT ANALYZED",
+                                        PAYLOAD_DECODE_FAILED: "DECODE FAILED · NOT ANALYZED",
+                                        ATTACHMENT_COUNT_LIMIT_EXCEEDED: "OMITTED BY COUNT LIMIT",
+                                    };
+                                    const analysisStatus = attachment.analysis_status || "NOT_ANALYZED";
+                                    const detectedType = staticResult.detected_type || "File signature not identified";
+                                    const findings = staticFindings.slice(0, 2).map((finding) => finding.title).filter(Boolean);
+                                    const malwareScan = attachment.malware_scan || {};
+                                    const scanStatus = String(malwareScan.status || "NOT_CONFIGURED").toUpperCase();
+                                    const scanSummary = scanStatus === "CLEAN"
+                                        ? "ClamAV: no detection (not a safety guarantee)"
+                                        : scanStatus === "INFECTED" || scanStatus === "MALICIOUS"
+                                            ? `ClamAV detected: ${malwareScan.signature || "malicious content"}`
+                                            : scanStatus === "ERROR"
+                                                ? "ClamAV scan error · verdict unavailable"
+                                                : scanStatus === "NOT_CONFIGURED"
+                                                    ? "Malware scan not configured"
+                                                    : "Malware scan incomplete · verdict unavailable";
+                                    return `
                                 <article class="attachment-evidence-item">
                                     <div class="attachment-evidence-icon" aria-hidden="true">${String(index + 1).padStart(2, "0")}</div>
                                     <div class="attachment-evidence-main">
@@ -2581,9 +2620,16 @@ const existingResult =
                                             <span>${attachment.size === null || attachment.size === undefined ? "Size not reported" : `${Number(attachment.size).toLocaleString()} bytes`}</span>
                                             ${attachment.sha256 ? `<code>SHA-256 ${escapeHTML(attachment.sha256)}</code>` : ""}
                                         </div>
+                                        <div class="attachment-evidence-findings">
+                                            <span>${escapeHTML(detectedType)}</span>
+                                            <span>${escapeHTML(scanSummary)}</span>
+                                            ${findings.map((finding) => `<span>${escapeHTML(finding)}</span>`).join("")}
+                                        </div>
                                     </div>
-                                    <span class="attachment-evidence-status">${escapeHTML(attachment.verdict || attachment.status || "METADATA PARSED")}</span>
+                                    <span class="attachment-evidence-status">${escapeHTML(statusLabels[analysisStatus] || attachment.verdict || attachment.status || analysisStatus.replaceAll("_", " "))}</span>
                                 </article>
+                                    `;
+                                })()}
                             `).join("")}
                         </div>
                     </section>
@@ -6511,10 +6557,22 @@ const existingResult =
                 });
                 const data = await response.json();
                 const ready = response.ok && data.status === "ok";
+                const integrations = data.optional_integrations || {};
+                const deploymentConstraints = data.deployment_constraints || {};
+                const scannerStatus = String(integrations.attachment_scanner || "").toUpperCase();
+                const routingStatus = String(integrations.recipient_region_routing || "").toUpperCase();
+                const integrationDetails = [];
+                if (deploymentConstraints.tenant_scope === "SINGLE_TENANT_ENFORCED") integrationDetails.push("Single-tenant deployment");
+                if (scannerStatus === "NOT_CONFIGURED") integrationDetails.push("ClamAV off · attachment scan unverified");
+                else if (scannerStatus === "UNAVAILABLE") integrationDetails.push("ClamAV unavailable · scan unverified");
+                else if (scannerStatus === "READY") integrationDetails.push("ClamAV connected");
+                if (routingStatus === "CENTRAL_FALLBACK_ONLY") integrationDetails.push("Cases route to Central SOC");
                 setBackendStatus(
                     ready ? "online" : "degraded",
                     ready ? "Backend Ready" : "Backend Degraded",
-                    ready ? "API and database are reachable" : "Readiness check did not pass"
+                    ready
+                        ? (integrationDetails.length ? integrationDetails.join(" · ") : "API and database are reachable")
+                        : "Readiness check did not pass"
                 );
             } catch (error) {
                 setBackendStatus("offline", "Backend Offline", "Start the MailTrace backend to load live data");
@@ -8461,10 +8519,10 @@ const existingResult =
             if (!host) return;
             const status = String(statusFilter?.value || "OPEN").toUpperCase();
             host.setAttribute("aria-busy", "true");
-            host.innerHTML = '<div class="investigations-loading">Loading persisted SLA alerts?</div>';
+            host.innerHTML = '<div class="investigations-loading">Loading persisted SLA alerts...</div>';
             try {
                 const response = await fetch(
-                    "http://127.0.0.1:8000/api/soc/routing/alerts?status=" + encodeURIComponent(status) + "&limit=100",
+                    String(window.MAILTRACE_API_BASE || "http://127.0.0.1:8002").replace(/\/+$/, "") + "/api/soc/routing/alerts?status=" + encodeURIComponent(status) + "&limit=100",
                     { headers: { "Accept": "application/json" }, cache: "no-store" }
                 );
                 const payload = await response.json().catch(() => ({}));
@@ -8482,8 +8540,8 @@ const existingResult =
                 const overdueCount = alerts.filter(item => Number(item.overdue) === 1).length;
                 const total = Number(payload.count || alerts.length);
                 host.innerHTML =
-                    '<div class="soc-alert-summary" role="status"><span><strong>' + total + '</strong> alert' + (total === 1 ? '' : 's') + '</span><span><strong>' + overdueCount + '</strong> overdue</span><span>Live data ? server persisted</span></div>' +
-                    '<div class="investigations-table-wrapper"><table class="investigations-table soc-alert-table"><thead><tr><th>CASE</th><th>SEVERITY / PRIORITY</th><th>SLA DEADLINE</th><th>ASSIGNEE</th><th>ROUTING</th><th>ESCALATIONS</th><th>ALERT STATUS</th></tr></thead><tbody>' +
+                    '<div class="soc-alert-summary" role="status"><span><strong>' + total + '</strong> alert' + (total === 1 ? '' : 's') + '</span><span><strong>' + overdueCount + '</strong> overdue</span><span>Live data - server persisted</span></div>' +
+                    '<div class="investigations-table-wrapper"><table class="investigations-table soc-alert-table"><thead><tr><th>CASE</th><th>SEVERITY / PRIORITY</th><th>SLA DEADLINE</th><th>ASSIGNEE</th><th>ROUTING</th><th>ESCALATIONS</th><th>ALERT STATUS</th><th>ACTION</th></tr></thead><tbody>' +
                     alerts.map(item => {
                         const statusText = String(item.status || "Unknown");
                         const count = Number(item.escalation_count);
@@ -8494,7 +8552,8 @@ const existingResult =
                             '<td>' + escapeHTML(item.assigned_analyst || "Unassigned") + '</td>' +
                             '<td><span class="soc-routing-status">' + escapeHTML(item.routing_status || "Unknown") + '</span></td>' +
                             '<td>' + (Number.isFinite(count) ? count : 0) + '</td>' +
-                            '<td><span class="soc-alert-status soc-alert-status-' + escapeHTML(statusText.toLowerCase()) + '">' + escapeHTML(statusText) + '</span><small>Updated ' + escapeHTML(item.last_seen_at || "unknown") + '</small></td></tr>';
+                            '<td><span class="soc-alert-status soc-alert-status-' + escapeHTML(statusText.toLowerCase()) + '">' + escapeHTML(statusText) + '</span><small>Updated ' + escapeHTML(item.last_seen_at || "unknown") + '</small></td>' +
+                            '<td>' + (statusText === "OPEN" ? '<button type="button" class="secondary-result-btn soc-sla-action" data-sla-action="acknowledge" data-alert-id="' + Number(item.alert_id) + '">Acknowledge</button>' : statusText === "ACKNOWLEDGED" ? '<button type="button" class="secondary-result-btn soc-sla-action" data-sla-action="resolve" data-alert-id="' + Number(item.alert_id) + '">Resolve</button>' : '<span class="muted">No action</span>') + '</td></tr>';
                     }).join("") + '</tbody></table></div>';
             } catch (error) {
                 host.innerHTML = '<div class="investigations-error"><strong>Unable to load SLA alerts</strong><p>' + escapeHTML(error.message || "The alerts service could not be reached.") + '</p><button type="button" class="secondary-result-btn" id="retrySocSlaAlerts">Retry alerts</button></div>';
@@ -8503,6 +8562,36 @@ const existingResult =
                 host.setAttribute("aria-busy", "false");
             }
         }
+
+        document.getElementById("socSlaAlertsContent")?.addEventListener("click", async (event) => {
+            const button = event.target.closest("button[data-sla-action][data-alert-id]");
+            if (!button || button.disabled) return;
+            const alertId = Number(button.dataset.alertId);
+            const action = button.dataset.slaAction;
+            if (!Number.isSafeInteger(alertId) || alertId < 1 || !["acknowledge", "resolve"].includes(action)) return;
+            button.disabled = true;
+            const oldLabel = button.textContent;
+            button.textContent = action === "acknowledge" ? "Acknowledging..." : "Resolving...";
+            try {
+                const base = String(window.MAILTRACE_API_BASE || "http://127.0.0.1:8002").replace(/\/+$/, "");
+                const response = await fetch(base + "/api/soc/routing/alerts/" + alertId + "/" + action, {
+                    method: "POST", headers: { "Accept": "application/json" }, cache: "no-store"
+                });
+                const payload = await response.json().catch(() => ({}));
+                if (!response.ok) throw new Error(typeof payload.detail === "string" ? payload.detail : "SLA alert action failed (" + response.status + ").");
+                await loadSlaAlerts();
+            } catch (error) {
+                button.disabled = false;
+                button.textContent = oldLabel;
+                const prior = host.querySelector(".soc-sla-action-error");
+                if (prior) prior.remove();
+                const message = document.createElement("p");
+                message.className = "soc-sla-action-error";
+                message.setAttribute("role", "alert");
+                message.textContent = error.message || "Unable to update SLA alert.";
+                host.prepend(message);
+            }
+        });
 
 async function loadCases() {
 
@@ -8627,7 +8716,7 @@ async function loadCases() {
                     <div class="soc-alerts-heading">
                         <div>
                             <div class="result-card-title" id="socSlaAlertsTitle">SOC SLA ALERTS</div>
-                            <p>Persisted escalation alerts for the authenticated tenant. Alert status is read-only until lifecycle actions are available in the API.</p>
+                            <p>Persisted escalation alerts for the authenticated tenant. Acknowledge and resolve actions are recorded by the server.</p>
                         </div>
                         <div class="soc-alerts-controls">
                             <label class="sr-only" for="socSlaAlertStatus">Alert status filter</label>
@@ -8639,7 +8728,7 @@ async function loadCases() {
                         </div>
                     </div>
                     <div id="socSlaAlertsContent" aria-live="polite" aria-busy="true">
-                        <div class="investigations-loading">SLA alerts will load from the backend?</div>
+                        <div class="investigations-loading">Loading persisted SLA alerts...</div>
                     </div>
                 </section>
 
@@ -10737,7 +10826,7 @@ async function loadCases() {
                     <div class="case-claim-actions">
                         <button type="button" id="caseClaimToggle" ${assignmentActive && !assignmentMine ? "disabled" : ""}>${assignmentMine ? "Release case" : assignmentActive ? "Claim held" : assignmentExpired ? "Reclaim expired claim" : "Claim case"}</button>
                         ${assignmentMine ? `<button type="button" id="caseClaimRenew">Renew lease</button>` : ""}
-                        <button type="button" id="caseClaimHistoryBtn">Assignment history</button>
+                        <button type="button" id="caseClaimHistoryBtn">Audit history</button>
                     </div>
                 </section>
 
@@ -10751,8 +10840,8 @@ async function loadCases() {
                     </div>
                 </section>
                 <section id="caseAssignmentHistory" class="result-card body-card soc-assignment-history" hidden>
-                    <div class="result-card-title">CLAIM & ROUTING AUDIT HISTORY</div>
-                    <div class="case-empty-state">Click Assignment history to load the tenant-scoped audit trail.</div>
+                    <div class="result-card-title">CASE & ASSIGNMENT AUDIT HISTORY</div>
+                    <div class="case-empty-state">Click Audit history to load case changes, ownership and routing events.</div>
                 </section>
 
 
@@ -11017,24 +11106,39 @@ async function loadCases() {
                 if (!panel) return;
                 button.disabled = true;
                 panel.hidden = false;
-                panel.querySelector(".result-card-title + .case-empty-state")?.replaceChildren(document.createTextNode("Loading audit history?"));
+                panel.querySelector(".result-card-title + .case-empty-state")?.replaceChildren(document.createTextNode("Loading audit history…"));
                 try {
                     const base = `http://127.0.0.1:8000`;
-                    const [claimResponse, routingResponse] = await Promise.all([
+                    const [claimResponse, routingResponse, caseAuditResponse] = await Promise.all([
                         fetch(`${base}/api/cases/${encodeURIComponent(caseData.case_id)}/history`),
-                        fetch(`${base}/api/soc/routing/cases/${encodeURIComponent(caseData.case_id)}/history`)
+                        fetch(`${base}/api/soc/routing/cases/${encodeURIComponent(caseData.case_id)}/history`),
+                        fetch(`${base}/api/cases/${encodeURIComponent(caseData.case_id)}/audit`)
                     ]);
                     const claimPayload = claimResponse.ok ? await claimResponse.json() : { events: [] };
                     const routingPayload = routingResponse.ok ? await routingResponse.json() : { events: [] };
+                    const caseAuditPayload = caseAuditResponse.ok ? await caseAuditResponse.json() : { events: [], integrity: null };
                     const events = [
+                        ...(caseAuditPayload.events || []).map(item => ({
+                            ...item,
+                            audit_type: "CASE",
+                            details_json: JSON.stringify({
+                                from_status: item.from_status,
+                                to_status: item.to_status,
+                                changed_fields: item.changed_fields || []
+                            })
+                        })),
                         ...(claimPayload.events || []).map(item => ({ ...item, audit_type: "CLAIM" })),
                         ...(routingPayload.events || []).map(item => ({ ...item, audit_type: "ROUTING" }))
                     ].sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
-                    panel.innerHTML = `<div class="result-card-title">CLAIM & ROUTING AUDIT HISTORY</div>` + (events.length
+                    const integrity = caseAuditPayload.integrity;
+                    const integrityLabel = integrity
+                        ? `Case audit chain: ${integrity.valid ? "VERIFIED" : "INTEGRITY FAILURE"} (${Number(integrity.verified_count || 0)}/${Number(integrity.event_count || 0)} events)`
+                        : "Case audit chain could not be verified.";
+                    panel.innerHTML = `<div class="result-card-title">CASE & ASSIGNMENT AUDIT HISTORY</div><div class="case-empty-state">${escapeHTML(integrityLabel)}</div>` + (events.length
                         ? `<div class="soc-audit-list">${events.map(item => { let details = {}; try { details = JSON.parse(item.details_json || "{}"); } catch (_) {} return `<div class="soc-audit-item"><strong>${escapeHTML(item.action || "EVENT")} | ${escapeHTML(item.audit_type)}</strong><span>${escapeHTML(item.created_at || "")}</span><small>Actor: ${escapeHTML(item.actor_subject || "system")} | Reason: ${escapeHTML(details.reason || item.reason || "not recorded")}</small></div>`; }).join("")}</div>`
-                        : `<div class="case-empty-state">No assignment audit events recorded yet.</div>`);
+                        : `<div class="case-empty-state">No case, assignment or routing audit events recorded yet.</div>`);
                 } catch (error) {
-                    panel.innerHTML = `<div class="result-card-title">CLAIM & ROUTING AUDIT HISTORY</div><div class="case-empty-state">${escapeHTML(error.message || "Unable to load assignment history.")}</div>`;
+                    panel.innerHTML = `<div class="result-card-title">CASE & ASSIGNMENT AUDIT HISTORY</div><div class="case-empty-state">${escapeHTML(error.message || "Unable to load audit history.")}</div>`;
                 } finally {
                     button.disabled = false;
                 }

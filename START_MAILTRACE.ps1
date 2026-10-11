@@ -6,7 +6,7 @@ $BackendPath = Join-Path $ProjectRoot "backend"
 
 $FrontendPath = Join-Path $ProjectRoot "frontend"
 
-$BackendPort = 8000
+$BackendPort = 8002
 
 $FrontendPort = 5503
 
@@ -318,3 +318,4 @@ else {
 
 Write-Host ""
 Read-Host "Press ENTER to close launcher"
+

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field
 from typing import Any
@@ -44,3 +44,4 @@ class ThreadAnalysisResult:
             for item in self.evidence
         ]
         return result
+

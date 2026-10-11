@@ -753,7 +753,10 @@ def _soc95_manage_incidents_base(
             alert_lookup,
         )
 
-        campaigns = [item.upper() for item in _extract_campaigns(raw_candidate, alert_lookup)]
+        campaigns = _extract_campaigns(
+            raw_candidate,
+            alert_lookup,
+        )
 
         actors = _extract_actors(
             raw_candidate,

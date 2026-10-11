@@ -1,4 +1,4 @@
-"""
+﻿"""
 MailTrace-AI
 Email Classification Engine
 
@@ -888,3 +888,4 @@ def classify_email_to_dict(
         authentication=authentication,
         threat_analysis=threat_analysis,
     ).to_dict()
+

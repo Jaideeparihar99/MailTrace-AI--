@@ -73,7 +73,6 @@ def _normalize_ioc(value: Any) -> str:
     return _normalize_token(value).rstrip(".")
 
 
-
 def _as_list(value: Any) -> List[Any]:
     if value is None:
         return []
@@ -198,7 +197,9 @@ def _extract_set(
             alert.get(key)
         ):
 
-            normalized = _normalize_token(value)
+            normalized = _normalize_token(
+                value
+            )
 
             if normalized:
                 result.add(

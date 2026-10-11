@@ -15,6 +15,12 @@ from typing import Any
 from services.attachment_intelligence.hashing import (
     calculate_hashes_from_bytes,
 )
+from services.data_protection import (
+    protect_evidence_bytes,
+    protect_evidence_filename,
+    reveal_evidence_bytes,
+    reveal_evidence_filename,
+)
 
 from .models import (
     CustodyEvent,
@@ -492,7 +498,7 @@ def preserve_evidence_bytes(
 
     try:
         with os.fdopen(fd, "wb") as handle:
-            handle.write(raw)
+            handle.write(protect_evidence_bytes(raw, evidence_id))
             handle.flush()
             os.fsync(handle.fileno())
 
@@ -504,7 +510,7 @@ def preserve_evidence_bytes(
         )
 
         with open(final_path, "rb") as handle:
-            preserved = handle.read()
+            preserved = reveal_evidence_bytes(handle.read(), evidence_id)
 
         preserved_hashes = _normalize_hashset(
             calculate_hashes_from_bytes(
@@ -644,14 +650,17 @@ class EvidenceCustodyLedger:
 
 
     def _state_body(self) -> dict[str, object]:
+        records = {}
+        for evidence_id, record in self._records.items():
+            payload = record.to_dict()
+            payload["original_filename"] = protect_evidence_filename(
+                payload.get("original_filename")
+            )
+            records[evidence_id] = payload
         return {
             "schema": "evidence_custody_state",
             "schema_version": STATE_SCHEMA_VERSION,
-            "records": {
-                evidence_id: record.to_dict()
-                for evidence_id, record
-                in self._records.items()
-            },
+            "records": records,
             "events": {
                 evidence_id: [
                     event.to_dict()
@@ -754,8 +763,8 @@ class EvidenceCustodyLedger:
             artifact_type=str(
                 payload["artifact_type"]
             ),
-            original_filename=payload.get(
-                "original_filename"
+            original_filename=reveal_evidence_filename(
+                payload.get("original_filename")
             ),
             media_type=payload.get(
                 "media_type"
@@ -1799,6 +1808,65 @@ class EvidenceCustodyLedger:
 
         return record
 
+    def encrypt_legacy_preservation_copies(self) -> int:
+        """Encrypt pre-existing plaintext vault files before production serves requests."""
+        migrated = 0
+        with self._storage_guard():
+            for evidence_id, record in self._records.items():
+                if not record.preservation_path:
+                    continue
+                path = Path(record.preservation_path)
+                raw = path.read_bytes()
+                plaintext = reveal_evidence_bytes(raw, evidence_id)
+                stored_hashes = _normalize_hashset(
+                    calculate_hashes_from_bytes(
+                        plaintext, algorithms=("sha256", "sha512")
+                    )
+                )
+                if stored_hashes != record.hashes:
+                    raise EvidenceIntegrityError(
+                        "Preservation copy failed startup verification."
+                    )
+                encrypted = protect_evidence_bytes(plaintext, evidence_id)
+                if encrypted == raw:
+                    continue
+                recovered = reveal_evidence_bytes(encrypted, evidence_id)
+                recovered_hashes = _normalize_hashset(
+                    calculate_hashes_from_bytes(
+                        recovered, algorithms=("sha256", "sha512")
+                    )
+                )
+                if recovered_hashes != record.hashes:
+                    raise EvidenceIntegrityError(
+                        "Evidence encryption migration hash verification failed."
+                    )
+                fd, temp_name = tempfile.mkstemp(
+                    prefix=".encrypt-evidence-",
+                    dir=str(path.parent),
+                )
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(encrypted)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.chmod(temp_name, 0o400)
+                    try:
+                        path.chmod(0o600)
+                    except OSError:
+                        pass
+                    os.replace(temp_name, path)
+                except Exception:
+                    try:
+                        Path(temp_name).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+                migrated += 1
+            # Re-persist metadata as well; this encrypts legacy filenames in
+            # the custody snapshot whenever a data key is first configured.
+            self._persist_state()
+        return migrated
+
     def events(
         self,
         evidence_id: str,
@@ -1984,6 +2052,94 @@ class EvidenceCustodyLedger:
                 target_state=EvidenceState.ARCHIVED.value,
             )
 
+    def purge_preservation_copy(
+        self,
+        evidence_id: str,
+        *,
+        actor: str,
+        policy_id: str,
+        reason: str,
+        expires_at_utc: str,
+    ) -> CustodyEvent:
+        """Irreversibly delete retained bytes while preserving the custody commitment."""
+        with self._storage_guard():
+            record = self.get(evidence_id)
+            if not record.sealed:
+                raise InvalidCustodyTransitionError(
+                    "Evidence must be sealed before retention purge."
+                )
+            if record.state == EvidenceState.PURGED.value:
+                return self._events[evidence_id][-1]
+            if record.state not in {
+                EvidenceState.SEALED.value,
+                EvidenceState.IN_CUSTODY.value,
+                EvidenceState.ARCHIVED.value,
+                EvidenceState.PURGE_PENDING.value,
+            }:
+                raise InvalidCustodyTransitionError(
+                    f"Cannot purge evidence in state {record.state}."
+                )
+            if not record.preservation_path:
+                raise EvidenceCustodyError(
+                    "No preserved raw evidence copy is registered."
+                )
+
+            path = Path(record.preservation_path)
+            if path.is_symlink():
+                raise EvidenceCustodyError(
+                    "Refusing to purge a preservation path that is a symbolic link."
+                )
+
+            metadata = {
+                "policy_id": _require_nonempty(policy_id, "policy_id", 128),
+                "expires_at_utc": _require_nonempty(expires_at_utc, "expires_at_utc", 128),
+                "preservation_path_sha256": _sha256_text(str(path.resolve(strict=False))),
+                "evidence_sha256": record.hashes.sha256,
+                "evidence_sha512": record.hashes.sha512,
+                "size_bytes": record.size_bytes,
+            }
+            if record.state != EvidenceState.PURGE_PENDING.value:
+                self._append_event(
+                    record,
+                    event_type=CustodyEventType.PURGE_REQUESTED,
+                    actor=actor,
+                    purpose="Policy-authorized raw evidence retention purge",
+                    reason=reason,
+                    metadata=metadata,
+                    target_state=EvidenceState.PURGE_PENDING.value,
+                )
+
+            try:
+                if path.exists():
+                    path.chmod(0o600)
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                try:
+                    if path.exists():
+                        path.chmod(0o444)
+                except OSError:
+                    pass
+                self._append_event(
+                    record,
+                    event_type=CustodyEventType.PURGE_FAILED,
+                    actor=actor,
+                    purpose="Policy-authorized raw evidence retention purge",
+                    reason=f"Preservation copy deletion failed: {type(error).__name__}",
+                    metadata=metadata,
+                    target_state=EvidenceState.PURGE_PENDING.value,
+                )
+                raise
+
+            return self._append_event(
+                record,
+                event_type=CustodyEventType.PRESERVATION_PURGED,
+                actor=actor,
+                purpose="Policy-authorized raw evidence retention purge",
+                reason=reason,
+                metadata=metadata,
+                target_state=EvidenceState.PURGED.value,
+            )
+
     def verify(
         self,
         evidence_id: str,
@@ -2049,8 +2205,13 @@ class EvidenceCustodyLedger:
                     )
 
             preservation_match = False
+            preservation_copy_purged = record.state == EvidenceState.PURGED.value
 
-            if record.preservation_path:
+            if preservation_copy_purged:
+                issues.append(
+                    "Raw content was intentionally purged under retention policy; only its committed hashes and custody history remain."
+                )
+            elif record.preservation_path:
                 preservation_path = Path(
                     record.preservation_path
                 )
@@ -2060,7 +2221,9 @@ class EvidenceCustodyLedger:
                         preservation_path,
                         "rb",
                     ) as handle:
-                        preserved = handle.read()
+                        preserved = reveal_evidence_bytes(
+                            handle.read(), evidence_id
+                        )
 
                     preserved_hashes = _normalize_hashset(
                         calculate_hashes_from_bytes(
@@ -2102,7 +2265,7 @@ class EvidenceCustodyLedger:
                 evidence_hash_match
                 and seal_match
                 and chain_valid
-                and preservation_match
+                and (preservation_match or preservation_copy_purged)
             )
 
             event_type = (
@@ -2132,6 +2295,7 @@ class EvidenceCustodyLedger:
                     "seal_hash_match": seal_match,
                     "custody_chain_valid": chain_valid,
                     "preservation_copy_match": preservation_match,
+                    "preservation_copy_purged": preservation_copy_purged,
                 },
                 target_state=target_state,
             )
@@ -2148,6 +2312,7 @@ class EvidenceCustodyLedger:
                 expected_sha256=record.hashes.sha256,
                 expected_sha512=record.hashes.sha512,
                 issues=issues,
+                preservation_copy_purged=preservation_copy_purged,
             )
 
     def verify_chain(

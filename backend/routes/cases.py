@@ -1,10 +1,25 @@
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional
 import uuid
 
-from database.database import get_connection, claim_case_for_analyst, release_case_claim
+from database.database import (
+    get_connection,
+    claim_case_for_analyst,
+    renew_case_claim,
+    release_case_claim,
+    route_case_to_soc,
+    get_case_routing,
+    allow_soc_action,
+    append_case_audit_event,
+    verify_case_audit_chain,
+    get_case_audit_events,
+)
 from services.access_control import is_production
+from services.data_protection import protect_investigation_row
+import logging
+
+_case_logger = logging.getLogger("mailtrace.cases")
 
 
 router = APIRouter(
@@ -35,11 +50,21 @@ class UpdateCaseRequest(BaseModel):
 class AddNoteRequest(BaseModel):
 
     note: str
-    author: Optional[str] = "Analyst"
+    # Kept for backward-compatible request parsing; server identity is authoritative.
+    author: Optional[str] = None
+
+
+class ClaimRequest(BaseModel):
+    reason: Optional[str] = None
 
 
 def _require_analyst_identity(request: Request):
     principal = getattr(request.state, "principal", None)
+    if is_production() and getattr(principal, "auth_method", "api_key") != "oidc":
+        raise HTTPException(
+            status_code=403,
+            detail="Production SOC case access requires a verified OIDC identity.",
+        )
     if (
         principal is None
         or not principal.roles.intersection(
@@ -55,46 +80,62 @@ def _require_analyst_identity(request: Request):
 
 
 def _enforce_case_claim_owner(connection, case_id: str, request: Request):
-    principal = getattr(request.state, "principal", None)
-    if principal is None:
-        return
-    active = connection.execute("""
-        SELECT assigned_analyst, lease_expires_at
+    principal = _require_analyst_identity(request)
+    case = connection.execute(
+        "SELECT case_id FROM cases WHERE case_id=? AND tenant_id=?",
+        (case_id, principal.tenant_id),
+    ).fetchone()
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found.")
+
+    claim = connection.execute("""
+        SELECT assigned_analyst, status, lease_expires_at,
+               datetime(lease_expires_at) > datetime('now') AS lease_valid
         FROM case_claims
-        WHERE case_id=? AND tenant_id=? AND status='ACTIVE'
-          AND datetime(lease_expires_at) > datetime('now')
+        WHERE case_id=? AND tenant_id=?
     """, (case_id, principal.tenant_id)).fetchone()
-    if active and principal.subject_id != active["assigned_analyst"]:
+    if not claim or claim["status"] != "ACTIVE" or not claim["lease_valid"]:
         raise HTTPException(
             status_code=423,
-            detail="Another analyst currently owns this case claim.",
+            detail="An active case claim is required before modifying this case. Claim or reclaim it first.",
         )
-
-
-def _case_tenant_params(request: Request):
-    principal = getattr(request.state, "principal", None)
-    tenant_id = getattr(principal, "tenant_id", "__local__")
-    # Older local databases predate tenant_id and contain NULL case rows.
-    # Keep those visible only to the synthetic local-development principal.
-    include_legacy_local = (
-        not is_production()
-        and tenant_id == "local"
-        and getattr(principal, "subject_id", None) == "local-dev-analyst"
+    if principal.subject_id != claim["assigned_analyst"]:
+        raise HTTPException(
+            status_code=423,
+            detail={
+                "message": "Another analyst currently owns this case claim.",
+                "assigned_analyst": claim["assigned_analyst"],
+                "lease_expires_at": claim["lease_expires_at"],
+            },
+        )
+    connection.execute(
+        "UPDATE case_routing SET last_activity_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE case_id=? AND tenant_id=?",
+        (case_id, principal.tenant_id),
     )
-    return tenant_id, int(include_legacy_local)
 
 
 @router.post("/{case_id}/claim")
-def claim_case(case_id: str, request: Request):
+def claim_case(
+    case_id: str,
+    request: Request,
+    payload: Optional[ClaimRequest] = None,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
+):
     principal = _require_analyst_identity(request)
-    assignment, claimed = claim_case_for_analyst(
-        case_id=case_id,
-        tenant_id=principal.tenant_id,
-        analyst_subject=principal.subject_id,
-        lease_minutes=20,
-    )
+    if not allow_soc_action(principal.tenant_id, principal.subject_id, "case_claim"):
+        raise HTTPException(status_code=429, detail="Too many case-claim actions; retry shortly.", headers={"Retry-After": "60"})
+    try:
+        assignment, claimed = claim_case_for_analyst(
+            case_id=case_id,
+            tenant_id=principal.tenant_id,
+            analyst_subject=principal.subject_id,
+            reason=(payload.reason if payload else None) or "claim requested",
+            idempotency_key=idempotency_key,
+        )
+    except PermissionError as error:
+        raise HTTPException(status_code=409, detail={"message": str(error)}) from error
     if assignment is None:
-        raise HTTPException(status_code=404, detail="Case not found.")
+        raise HTTPException(status_code=404, detail="Case not found for this tenant.")
     if not claimed:
         raise HTTPException(
             status_code=409,
@@ -106,22 +147,108 @@ def claim_case(case_id: str, request: Request):
     return {"success": True, "assignment": assignment}
 
 
-@router.post("/{case_id}/release")
-def release_case(case_id: str, request: Request):
+@router.post("/{case_id}/renew")
+def renew_case_claim_endpoint(
+    case_id: str,
+    request: Request,
+    payload: Optional[ClaimRequest] = None,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
+):
     principal = _require_analyst_identity(request)
+    if not allow_soc_action(principal.tenant_id, principal.subject_id, "case_renew"):
+        raise HTTPException(status_code=429, detail="Too many claim-renewal actions; retry shortly.", headers={"Retry-After": "60"})
+    assignment, renewed = renew_case_claim(
+        case_id=case_id,
+        tenant_id=principal.tenant_id,
+        analyst_subject=principal.subject_id,
+        reason=(payload.reason if payload else None) or "renew requested",
+        idempotency_key=idempotency_key,
+    )
+    if assignment is None:
+        raise HTTPException(status_code=404, detail="Case has no claim in this tenant.")
+    if not renewed:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Only the current owner with an unexpired claim can renew it.",
+                "assignment": assignment,
+            },
+        )
+    return {"success": True, "assignment": assignment}
+
+
+@router.post("/{case_id}/release")
+def release_case(
+    case_id: str,
+    request: Request,
+    payload: Optional[ClaimRequest] = None,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
+):
+    principal = _require_analyst_identity(request)
+    if not allow_soc_action(principal.tenant_id, principal.subject_id, "case_release"):
+        raise HTTPException(status_code=429, detail="Too many claim-release actions; retry shortly.", headers={"Retry-After": "60"})
     assignment, released = release_case_claim(
         case_id=case_id,
         tenant_id=principal.tenant_id,
         analyst_subject=principal.subject_id,
+        reason=(payload.reason if payload else None) or "release requested",
+        idempotency_key=idempotency_key,
     )
     if assignment is None:
-        raise HTTPException(status_code=404, detail="Case has no claim.")
+        raise HTTPException(status_code=404, detail="Case has no claim in this tenant.")
     if not released:
         raise HTTPException(
             status_code=409,
-            detail="Only the analyst who currently owns the claim can release it.",
+            detail={
+                "message": "Only the current owner with an unexpired lease can release this claim.",
+                "assignment": assignment,
+            },
         )
     return {"success": True, "assignment": assignment}
+
+
+@router.get("/{case_id}/history")
+def case_claim_history(case_id: str, request: Request):
+    principal = _require_analyst_identity(request)
+    connection = get_connection()
+    try:
+        case = connection.execute(
+            "SELECT 1 FROM cases WHERE case_id=? AND tenant_id=?",
+            (case_id, principal.tenant_id),
+        ).fetchone()
+        if case is None:
+            raise HTTPException(status_code=404, detail="Case not found.")
+        rows = connection.execute("""
+            SELECT id, case_id, tenant_id, actor_subject, action, details_json, created_at
+            FROM case_claim_events
+            WHERE case_id=? AND tenant_id=?
+            ORDER BY id ASC
+        """, (case_id, principal.tenant_id)).fetchall()
+        return {"success": True, "events": [dict(row) for row in rows]}
+    finally:
+        connection.close()
+
+
+@router.get("/{case_id}/audit")
+def case_audit_history(case_id: str, request: Request):
+    """Return actor-attributed case changes and the tenant chain-integrity result."""
+    principal = _require_analyst_identity(request)
+    connection = get_connection()
+    try:
+        case = connection.execute(
+            "SELECT 1 FROM cases WHERE case_id=? AND tenant_id=?",
+            (case_id, principal.tenant_id),
+        ).fetchone()
+        if case is None:
+            raise HTTPException(status_code=404, detail="Case not found.")
+    finally:
+        connection.close()
+    return {
+        "success": True,
+        "case_id": case_id,
+        "events": get_case_audit_events(principal.tenant_id, case_id),
+        "integrity": verify_case_audit_chain(principal.tenant_id),
+    }
 
 
 # ==========================================
@@ -131,8 +258,7 @@ def release_case(case_id: str, request: Request):
 @router.get("")
 def list_cases(request: Request):
 
-    tenant_id, include_legacy_local = _case_tenant_params(request)
-
+    principal = _require_analyst_identity(request)
     connection = get_connection()
 
     try:
@@ -150,14 +276,14 @@ def list_cases(request: Request):
                 cc.assigned_analyst,
                 cc.claimed_at,
                 cc.lease_expires_at,
-                cc.status AS assignment_status
+                cc.status AS assignment_status,
+                CASE WHEN cc.status='ACTIVE' AND datetime(cc.lease_expires_at)<=datetime('now') THEN 1 ELSE 0 END AS claim_expired
             FROM cases
             LEFT JOIN case_claims cc
               ON cc.case_id=cases.case_id
              AND cc.tenant_id=?
              AND cc.status='ACTIVE'
-             AND datetime(cc.lease_expires_at) > datetime('now')
-            WHERE (cases.tenant_id = ? OR (cases.tenant_id IS NULL AND ? = 1))
+            WHERE cases.tenant_id=?
               AND (cases.title NOT LIKE 'Automated % email review %'
                OR EXISTS (
                     SELECT 1
@@ -165,10 +291,9 @@ def list_cases(request: Request):
                     WHERE a.case_id = cases.case_id
                       AND a.recommended_action = 'QUARANTINE'
                       AND a.confidence = 'HIGH'
-                 )
-              )
+               ))
             ORDER BY cases.created_at DESC
-        """, (tenant_id, tenant_id, include_legacy_local)).fetchall()
+        """, (principal.tenant_id, principal.tenant_id)).fetchall()
 
         return {
             "success": True,
@@ -188,8 +313,7 @@ def list_cases(request: Request):
 @router.get("/{case_id}")
 def get_case(case_id: str, request: Request):
 
-    tenant_id, include_legacy_local = _case_tenant_params(request)
-
+    principal = _require_analyst_identity(request)
     connection = get_connection()
 
     try:
@@ -207,32 +331,29 @@ def get_case(case_id: str, request: Request):
                 cc.assigned_analyst,
                 cc.claimed_at,
                 cc.lease_expires_at,
-                cc.status AS assignment_status
+                cc.status AS assignment_status,
+                CASE WHEN cc.status='ACTIVE' AND datetime(cc.lease_expires_at)<=datetime('now') THEN 1 ELSE 0 END AS claim_expired
             FROM cases
             LEFT JOIN case_claims cc
               ON cc.case_id=cases.case_id
              AND cc.tenant_id=?
              AND cc.status='ACTIVE'
-             AND datetime(cc.lease_expires_at) > datetime('now')
             WHERE cases.case_id = ?
-              AND (cases.tenant_id = ? OR (cases.tenant_id IS NULL AND ? = 1))
+              AND cases.tenant_id=?
               AND (
                     title NOT LIKE 'Automated % email review %'
                     OR EXISTS (
                         SELECT 1
                         FROM email_alerts a
                         WHERE a.case_id = cases.case_id
-                          AND a.tenant_id = ?
                           AND a.recommended_action = 'QUARANTINE'
                           AND a.confidence = 'HIGH'
                     )
               )
         """, (
-            tenant_id,
+            principal.tenant_id,
             case_id,
-            tenant_id,
-            include_legacy_local,
-            tenant_id,
+            principal.tenant_id,
         )).fetchone()
 
         if case is None:
@@ -254,11 +375,12 @@ def get_case(case_id: str, request: Request):
                 i.threat_confidence,
                 i.created_at
             FROM case_investigations ci
-            LEFT JOIN investigations i
+            JOIN investigations i
                 ON i.investigation_id = ci.investigation_id
-            WHERE ci.case_id = ? AND ci.tenant_id = ?
+               AND i.tenant_id = ?
+            WHERE ci.case_id = ?
             ORDER BY ci.created_at DESC
-        """, (case_id, getattr(getattr(request.state, "principal", None), "tenant_id", "__local__"))).fetchall()
+        """, (principal.tenant_id, case_id)).fetchall()
 
         notes = connection.execute("""
             SELECT
@@ -267,9 +389,9 @@ def get_case(case_id: str, request: Request):
                 author,
                 created_at
             FROM case_notes
-            WHERE case_id = ? AND tenant_id = ?
+            WHERE case_id = ?
             ORDER BY created_at DESC
-        """, (case_id, getattr(getattr(request.state, "principal", None), "tenant_id", "__local__"))).fetchall()
+        """, (case_id,)).fetchall()
 
         evidence = connection.execute("""
             SELECT
@@ -280,9 +402,9 @@ def get_case(case_id: str, request: Request):
                 investigation_id,
                 created_at
             FROM evidence
-            WHERE case_id = ? AND tenant_id = ?
+            WHERE case_id = ?
             ORDER BY created_at DESC
-        """, (case_id, getattr(getattr(request.state, "principal", None), "tenant_id", "__local__"))).fetchall()
+        """, (case_id,)).fetchall()
 
         case_payload = dict(case)
         principal = getattr(request.state, "principal", None)
@@ -291,12 +413,13 @@ def get_case(case_id: str, request: Request):
             and principal.subject_id
             and case_payload.get("assigned_analyst") == principal.subject_id
             and case_payload.get("assignment_status") == "ACTIVE"
+            and not case_payload.get("claim_expired")
         )
 
         return {
             "success": True,
             "case": case_payload,
-            "investigations": [dict(row) for row in investigations],
+            "investigations": [protect_investigation_row(dict(row)) for row in investigations],
             "notes": [dict(row) for row in notes],
             "evidence": [dict(row) for row in evidence]
         }
@@ -313,6 +436,7 @@ def get_case(case_id: str, request: Request):
 @router.post("")
 def create_case(request: CreateCaseRequest, http_request: Request):
 
+    principal = _require_analyst_identity(http_request)
     case_id = (
         "CASE-"
         + uuid.uuid4().hex[:10].upper()
@@ -325,6 +449,8 @@ def create_case(request: CreateCaseRequest, http_request: Request):
     connection = get_connection()
 
     try:
+
+        connection.execute("BEGIN IMMEDIATE")
 
         connection.execute("""
             INSERT INTO cases (
@@ -339,13 +465,32 @@ def create_case(request: CreateCaseRequest, http_request: Request):
             VALUES (?, ?, ?, ?, ?, 'OPEN', 0)
         """, (
             case_id,
-            getattr(getattr(http_request.state, "principal", None), "tenant_id", "__local__"),
+            principal.tenant_id,
             request.title,
             request.description or "",
             severity
         ))
 
+        append_case_audit_event(
+            connection,
+            principal.tenant_id,
+            case_id,
+            principal.subject_id,
+            "CASE_CREATED",
+            to_status="OPEN",
+            changed_fields=["title", "description", "severity", "status"],
+        )
+
         connection.commit()
+
+        routing = None
+        try:
+            routing = route_case_to_soc(
+                case_id, principal.tenant_id, "", actor_subject=principal.subject_id,
+                required_skills=["phishing"] if severity in {"HIGH", "CRITICAL"} else [],
+            )
+        except Exception:
+            _case_logger.exception("case_routing_pending tenant_id=%s case_id=%s", principal.tenant_id, case_id)
 
         return {
             "success": True,
@@ -356,7 +501,9 @@ def create_case(request: CreateCaseRequest, http_request: Request):
                 "severity": severity,
                 "status": "OPEN",
                 "threat_score": 0
-            }
+            },
+            "routing": routing,
+            "routing_status": "ASSIGNED" if routing and routing.get("assigned_analyst") else "UNASSIGNED",
         }
 
     finally:
@@ -374,16 +521,19 @@ def update_case(
     request: UpdateCaseRequest,
     http_request: Request,
 ):
+    principal = _require_analyst_identity(http_request)
 
     connection = get_connection()
 
     try:
 
+        connection.execute("BEGIN IMMEDIATE")
+
         existing = connection.execute("""
-            SELECT case_id
+            SELECT case_id, title, description, severity, status
             FROM cases
             WHERE case_id = ? AND tenant_id = ?
-        """, (case_id, getattr(getattr(http_request.state, "principal", None), "tenant_id", "__local__"))).fetchone()
+        """, (case_id, principal.tenant_id)).fetchone()
 
         if existing is None:
 
@@ -396,22 +546,34 @@ def update_case(
 
         fields = []
         values = []
+        changed_fields = []
 
         if request.title is not None:
             fields.append("title = ?")
             values.append(request.title)
+            if request.title != existing["title"]:
+                changed_fields.append("title")
 
         if request.description is not None:
             fields.append("description = ?")
             values.append(request.description)
+            if request.description != existing["description"]:
+                changed_fields.append("description")
 
         if request.severity is not None:
             fields.append("severity = ?")
             values.append(request.severity.upper())
+            if request.severity.upper() != str(existing["severity"] or "").upper():
+                changed_fields.append("severity")
 
         if request.status is not None:
+            normalized_status = request.status.strip().upper().replace(" ", "_")
+            if normalized_status not in {"OPEN", "IN_PROGRESS", "INVESTIGATING", "RESOLVED", "CLOSED"}:
+                raise HTTPException(status_code=422, detail="Unsupported case status.")
             fields.append("status = ?")
-            values.append(request.status.upper())
+            values.append(normalized_status)
+            if normalized_status != str(existing["status"] or "OPEN").upper().replace(" ", "_"):
+                changed_fields.append("status")
 
         if not fields:
 
@@ -424,7 +586,7 @@ def update_case(
             "updated_at = CURRENT_TIMESTAMP"
         )
 
-        values.append(case_id)
+        values.extend([case_id, principal.tenant_id])
 
         connection.execute(
             f"""
@@ -432,7 +594,18 @@ def update_case(
             SET {", ".join(fields)}
             WHERE case_id = ? AND tenant_id = ?
             """,
-            values + [getattr(getattr(http_request.state, "principal", None), "tenant_id", "__local__")]
+            values
+        )
+
+        append_case_audit_event(
+            connection,
+            principal.tenant_id,
+            case_id,
+            principal.subject_id,
+            "CASE_UPDATED",
+            from_status=str(existing["status"] or "OPEN").upper(),
+            to_status=(normalized_status if request.status is not None else str(existing["status"] or "OPEN").upper()),
+            changed_fields=changed_fields,
         )
 
         connection.commit()
@@ -457,16 +630,17 @@ def attach_investigation(
     investigation_id: str,
     request: Request,
 ):
+    principal = _require_analyst_identity(request)
 
     connection = get_connection()
 
     try:
 
         case = connection.execute("""
-            SELECT case_id
+            SELECT case_id, status
             FROM cases
             WHERE case_id = ? AND tenant_id = ?
-        """, (case_id, getattr(getattr(request.state, "principal", None), "tenant_id", "__local__"))).fetchone()
+        """, (case_id, principal.tenant_id)).fetchone()
 
         if case is None:
 
@@ -482,8 +656,8 @@ def attach_investigation(
                 investigation_id,
                 threat_score
             FROM investigations
-            WHERE investigation_id = ? AND tenant_id = ?
-        """, (investigation_id, getattr(getattr(request.state, "principal", None), "tenant_id", "__local__"))).fetchone()
+            WHERE investigation_id = ?
+        """, (investigation_id,)).fetchone()
 
         if investigation is None:
 
@@ -495,13 +669,11 @@ def attach_investigation(
         connection.execute("""
             INSERT OR IGNORE INTO case_investigations (
                 case_id,
-                tenant_id,
                 investigation_id
             )
-            VALUES (?, ?, ?)
+            VALUES (?, ?)
         """, (
             case_id,
-            getattr(getattr(request.state, "principal", None), "tenant_id", "__local__"),
             investigation_id
         ))
 
@@ -517,8 +689,19 @@ def attach_investigation(
         """, (
             int(investigation["threat_score"] or 0),
             case_id,
-            getattr(getattr(request.state, "principal", None), "tenant_id", "__local__")
+            principal.tenant_id,
         ))
+
+        append_case_audit_event(
+            connection,
+            principal.tenant_id,
+            case_id,
+            principal.subject_id,
+            "INVESTIGATION_ATTACHED",
+            from_status=str(case["status"] or "OPEN"),
+            to_status=str(case["status"] or "OPEN"),
+            changed_fields=["investigation_link"],
+        )
 
         connection.commit()
 
@@ -543,15 +726,16 @@ def add_case_note(
     http_request: Request,
 ):
 
+    principal = _require_analyst_identity(http_request)
     connection = get_connection()
 
     try:
 
         case = connection.execute("""
-            SELECT case_id
+            SELECT case_id, status
             FROM cases
             WHERE case_id = ? AND tenant_id = ?
-        """, (case_id, getattr(getattr(http_request.state, "principal", None), "tenant_id", "__local__"))).fetchone()
+        """, (case_id, principal.tenant_id)).fetchone()
 
         if case is None:
 
@@ -565,17 +749,26 @@ def add_case_note(
         cursor = connection.execute("""
             INSERT INTO case_notes (
                 case_id,
-                tenant_id,
                 note,
                 author
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?)
         """, (
             case_id,
-            getattr(getattr(http_request.state, "principal", None), "tenant_id", "__local__"),
             request.note,
-            request.author or "Analyst"
+            principal.subject_id
         ))
+
+        append_case_audit_event(
+            connection,
+            principal.tenant_id,
+            case_id,
+            principal.subject_id,
+            "ANALYST_NOTE_ADDED",
+            from_status=str(case["status"] or "OPEN"),
+            to_status=str(case["status"] or "OPEN"),
+            changed_fields=["analyst_note"],
+        )
 
         connection.commit()
 

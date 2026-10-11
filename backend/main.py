@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+﻿from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from email import policy
 from email.parser import BytesParser
@@ -9,11 +9,15 @@ from typing import Literal
 from services.access_control import (
     ApiPrincipal,
     authenticate_api_key,
+    authenticate_oidc_token,
     configured_api_keys,
     is_production,
+    oidc_is_configured,
+    oidc_public_client_config,
 )
 
 from services.email_parser import parse_email
+from services.attachment_intelligence.clamav_scanner import health_status as clamav_health_status
 from services.ip_intelligence import analyze_ip, analyze_ips
 
 from database.database import (
@@ -22,8 +26,17 @@ from database.database import (
     initialize_email_alerts,
     initialize_employee_email_reports,
     initialize_case_claims,
+    initialize_case_audit,
     initialize_soc_routing,
+    get_routing_tenant_ids,
+    get_pending_cases_for_routing,
+    process_sla_escalations,
+    route_case_to_soc,
+    get_case_routing,
     begin_email_webhook_event,
+    record_email_gateway_action,
+    get_email_gateway_action_state,
+    verify_email_gateway_action_chain,
     complete_email_webhook_event,
     fail_email_webhook_event,
     create_email_alert,
@@ -37,10 +50,18 @@ from database.database import (
     get_employee_email_report,
     initialize_threat_intelligence_table,
     upgrade_threat_intelligence_schema,
+    get_threat_intelligence_source_status,
     save_investigation,
     get_all_investigations,
     get_investigation_snapshot_marker,
     get_investigation,
+    get_evidence_retention_state,
+    set_evidence_retention_holds,
+    get_retention_tenant_ids,
+    recipient_routing_key_configured,
+    process_expired_derived_retention,
+    claim_threat_intelligence_sync_lease,
+    release_threat_intelligence_sync_lease,
 )
 
 from routes.investigations import router as investigations_router
@@ -64,6 +85,10 @@ from database.database import (
 from database.database import get_connection, renew_email_webhook_event_lease
 
 from services.threat_intelligence_v2.engine import analyze_threat_intelligence_v2
+from services.threat_intelligence.sync_service import (
+    configured_provider_count,
+    sync_threat_intelligence_feeds,
+)
 from services.campaign_correlation import correlate_campaigns
 from services.email_ai.engine import analyze_email_ai
 from services.email_ai.intelligence_fusion import analyze_email_intelligence
@@ -73,7 +98,11 @@ from services.ioc_timeline import build_ioc_timeline
 from services.recommendation_engine import recommend_actions
 from services.response_execution import transition_response
 from services.response_verification import verify_response
-from services.email_alerting import build_mail_flow_decision, should_create_alert
+from services.email_alerting import (
+    build_mail_flow_decision,
+    should_create_alert,
+    verify_gateway_action_signature,
+)
 from services.threat_hunting import hunt_threats
 
 import json
@@ -116,13 +145,124 @@ logging.basicConfig(
 )
 api_logger = logging.getLogger("mailtrace.api")
 
+async def _sla_escalation_worker(ti_sync_interval_minutes: int = 60):
+    """Reconcile pending cases and SLA escalations; DB transactions make multi-worker runs safe."""
+    next_retention_scan = 0.0
+    next_ti_sync = 0.0
+    while True:
+        try:
+            routing_tenants = (
+                [os.getenv("MAILTRACE_SINGLE_TENANT_ID", "").strip()]
+                if is_production()
+                else get_routing_tenant_ids()
+            )
+            for tenant_id in filter(None, routing_tenants):
+                for case in get_pending_cases_for_routing(tenant_id):
+                    incident_type = str(case.get("incident_type") or "")
+                    required_skills = {
+                        "suspicious": ["phishing"],
+                        "clicked_link": ["phishing", "url-analysis"],
+                        "opened_attachment": ["malware-analysis"],
+                        "shared_credentials": ["bec", "incident-response"],
+                        "made_payment": ["bec", "incident-response"],
+                    }.get(incident_type, ["phishing"] if str(case.get("severity", "")).upper() in {"HIGH", "CRITICAL"} else [])
+                    try:
+                        route_case_to_soc(
+                            case["case_id"], tenant_id, str(case.get("reporter_subject") or ""),
+                            actor_subject="system:routing-reconciler", required_skills=required_skills,
+                        )
+                    except Exception:
+                        api_logger.exception("soc_case_routing_reconcile_failed tenant_id=%s case_id=%s", tenant_id, case["case_id"])
+                process_sla_escalations(tenant_id)
+            if time.monotonic() >= next_retention_scan:
+                retention_tenants = (
+                    [os.getenv("MAILTRACE_SINGLE_TENANT_ID", "").strip()]
+                    if is_production()
+                    else get_retention_tenant_ids()
+                )
+                for tenant_id in filter(None, retention_tenants):
+                    try:
+                        process_expired_derived_retention(
+                            tenant_id,
+                            purge_raw_evidence=lambda evidence_id, **policy: evidence_custody.purge_preservation_copy(
+                                evidence_id,
+                                actor="system:retention",
+                                **policy,
+                            ),
+                        )
+                    except Exception:
+                        api_logger.exception("privacy_retention_run_failed tenant_id=%s", tenant_id)
+                next_retention_scan = time.monotonic() + 3600
+            if ti_sync_interval_minutes and time.monotonic() >= next_ti_sync:
+                lease_token = None
+                try:
+                    lease_token = await asyncio.to_thread(claim_threat_intelligence_sync_lease)
+                    if not lease_token:
+                        next_ti_sync = time.monotonic() + 60
+                        await asyncio.sleep(60)
+                        continue
+                    provider_count = await asyncio.to_thread(configured_provider_count)
+                    if provider_count:
+                        sync_result = await asyncio.to_thread(
+                            sync_threat_intelligence_feeds,
+                            days=1,
+                            synced_by="system:scheduled-threat-intelligence-sync",
+                        )
+                        api_logger.info(
+                            "threat_intelligence_sync_completed sync_id=%s success=%s providers=%s",
+                            sync_result.get("sync_id"),
+                            sync_result.get("success"),
+                            provider_count,
+                        )
+                except Exception as sync_error:
+                    api_logger.exception(
+                        "threat_intelligence_scheduled_sync_failed error_type=%s",
+                        type(sync_error).__name__,
+                    )
+                finally:
+                    if lease_token:
+                        try:
+                            await asyncio.to_thread(release_threat_intelligence_sync_lease, lease_token)
+                        except Exception:
+                            api_logger.exception("threat_intelligence_sync_lease_release_failed")
+                next_ti_sync = time.monotonic() + ti_sync_interval_minutes * 60
+        except Exception:
+            api_logger.exception("soc_sla_escalation_worker_failed")
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Fail at startup on a broken hosted deployment instead of serving an app
-    # that looks healthy while every protected API request is unusable.
+    # Hosted startup must have at least one fully configured auth path. OIDC-only
+    # deployments do not need to configure static API keys for human SOC access.
     if is_production():
-        configured_api_keys()
-    yield
+        if not os.getenv("MAILTRACE_SINGLE_TENANT_ID", "").strip():
+            raise RuntimeError("MAILTRACE_SINGLE_TENANT_ID is required until all legacy stores are tenant-scoped.")
+        if not oidc_is_configured() or not oidc_public_client_config().get("enabled"):
+            raise RuntimeError(
+                "Production SOC access requires complete OIDC issuer/JWKS and public-client configuration."
+            )
+        if os.getenv("MAILTRACE_API_KEYS_JSON", "").strip():
+            configured_api_keys()
+        webhook_secret = os.getenv("MAILTRACE_WEBHOOK_SECRET", "").strip()
+        webhook_tenant = os.getenv("MAILTRACE_WEBHOOK_TENANT_ID", "").strip()
+        if webhook_secret and webhook_tenant != os.getenv("MAILTRACE_SINGLE_TENANT_ID", "").strip():
+            raise RuntimeError("MAILTRACE_WEBHOOK_TENANT_ID must match MAILTRACE_SINGLE_TENANT_ID.")
+    try:
+        ti_sync_interval_minutes = int(os.getenv("MAILTRACE_TI_SYNC_INTERVAL_MINUTES", "60"))
+    except ValueError as error:
+        raise RuntimeError("MAILTRACE_TI_SYNC_INTERVAL_MINUTES must be 0 or an integer from 15 to 1440.") from error
+    if ti_sync_interval_minutes != 0 and not 15 <= ti_sync_interval_minutes <= 1440:
+        raise RuntimeError("MAILTRACE_TI_SYNC_INTERVAL_MINUTES must be 0 or an integer from 15 to 1440.")
+    worker = asyncio.create_task(_sla_escalation_worker(ti_sync_interval_minutes))
+    try:
+        yield
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
@@ -133,11 +273,6 @@ app = FastAPI(
 )
 
 MAX_EMAIL_UPLOAD_BYTES = 25 * 1024 * 1024
-
-
-def _request_tenant_id(request: Request):
-    principal = getattr(getattr(request, "state", None), "principal", None)
-    return principal.tenant_id if isinstance(principal, ApiPrincipal) else None
 WEBHOOK_LEASE_HEARTBEAT_SECONDS = 60
 SOC_API_PREFIXES = (
     "/api/alerts",
@@ -146,12 +281,13 @@ SOC_API_PREFIXES = (
     "/api/evidence",
     "/api/investigations",
     "/api/ip-intelligence",
+    "/api/privacy/retention",
     "/api/reports",
+    "/api/soc/routing",
     "/api/response-management",
     "/api/threat-hunting",
     "/api/threat-intelligence",
     "/api/ioc-timeline",
-    "/api/soc/routing",
 )
 SOC_API_PATHS = {
     "/api/analyze-email",
@@ -164,13 +300,13 @@ SOC_ACCESS_ROLES = {
 EMPLOYEE_API_PREFIX = "/api/employee/reports"
 
 
-def _start_webhook_lease_heartbeat(event_id: str, lease_token: str, tenant_id: str | None = None):
+def _start_webhook_lease_heartbeat(event_id: str, lease_token: str):
     stop_event = Event()
 
     def renew_until_stopped():
         while not stop_event.wait(WEBHOOK_LEASE_HEARTBEAT_SECONDS):
             try:
-                if not renew_email_webhook_event_lease(event_id, lease_token, tenant_id):
+                if not renew_email_webhook_event_lease(event_id, lease_token):
                     return
             except Exception:
                 api_logger.exception("webhook_lease_renewal_failed")
@@ -194,12 +330,16 @@ async def authenticate_api_requests(request: Request, call_next):
     if not request.url.path.startswith("/api/") or request.method == "OPTIONS":
         return await call_next(request)
 
+    # Public OIDC client metadata contains no secrets and is needed before login.
+    if request.url.path == "/api/auth/config":
+        return await call_next(request)
+
     # Health probes expose only service/dependency status, never tenant data.
-    if request.url.path in {"/api/health", "/api/ready", "/api/live"}:
+    if request.url.path in {"/api/health", "/api/ready"}:
         return await call_next(request)
 
     # This endpoint validates its own timestamped HMAC signature.
-    if request.url.path == "/api/webhooks/email":
+    if request.url.path == "/api/webhooks/email" or request.url.path.startswith("/api/webhooks/email/"):
         return await call_next(request)
 
     production = is_production()
@@ -227,11 +367,15 @@ async def authenticate_api_requests(request: Request, call_next):
             headers={"WWW-Authenticate": "Bearer"},
         )
     try:
-        principal = authenticate_api_key(token.strip(), configured_api_keys())
+        bearer_token = token.strip()
+        if bearer_token.count(".") == 2:
+            principal = authenticate_oidc_token(bearer_token)
+        else:
+            principal = authenticate_api_key(bearer_token, configured_api_keys())
     except RuntimeError:
         return JSONResponse(
             status_code=503,
-            content={"detail": "API authentication is not configured safely."},
+            content={"detail": "Authentication is not configured safely or the identity provider is unavailable."},
         )
     if principal is None:
         return JSONResponse(
@@ -318,6 +462,7 @@ initialize_email_webhook_events()
 initialize_email_alerts()
 initialize_employee_email_reports()
 initialize_case_claims()
+initialize_case_audit()
 initialize_soc_routing()
 
 # =========================================================
@@ -338,6 +483,8 @@ _configured_cors_origins = [
     if origin.strip()
 ]
 _default_cors_origins = [
+    "http://127.0.0.1:5504",
+    "http://localhost:5504",
     "http://127.0.0.1:5503",
     "http://localhost:5503",
     "http://127.0.0.1:5500",
@@ -352,6 +499,7 @@ app.add_middleware(
     expose_headers=["X-Request-ID"],
     allow_headers=[
         "Content-Type",
+        "Idempotency-Key",
         "Authorization",
         "X-Webhook-Signature",
         "X-Webhook-Event-ID",
@@ -400,6 +548,11 @@ RUNTIME_DATA_DIR.mkdir(
 evidence_custody = EvidenceCustodyLedger(
     ledger_path=EVIDENCE_STATE_PATH,
 )
+if (
+    os.getenv("MAILTRACE_DATA_ENCRYPTION_KEY", "").strip()
+    or os.getenv("MAILTRACE_DATA_ENCRYPTION_KEYS_JSON", "").strip()
+):
+    evidence_custody.encrypt_legacy_preservation_copies()
 
 # Independent integrity boundary.
 integrity_anchoring = IntegrityAnchorEngine(
@@ -409,37 +562,58 @@ integrity_anchoring = IntegrityAnchorEngine(
 )
 
 # Governance applies to derived/control-plane data.
+def _configured_retention_days(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be an integer number of days.") from error
+    if value < 0 or value > 3650:
+        raise RuntimeError(f"{name} must be between 0 and 3650 days.")
+    return value
+
+
+def _configured_retention_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    if raw not in {"true", "false"}:
+        raise RuntimeError(f"{name} must be exactly true or false.")
+    return raw == "true"
+
+
+_PURGE_RAW_EVIDENCE = _configured_retention_bool("MAILTRACE_PURGE_RAW_EVIDENCE", False)
+
+
 privacy_governance = PrivacyGovernanceEngine(
     policies=[
         RetentionPolicy(
             policy_id="mailtrace-default",
             name="MailTrace Default Evidence Policy",
             classification="INTERNAL",
-            retention_days=365,
+            retention_days=_configured_retention_days("MAILTRACE_RETENTION_DAYS_INTERNAL", 365),
             legal_hold_allowed=True,
             forensic_hold_allowed=True,
             purge_derived_views=True,
-            purge_raw_evidence=False,
+            purge_raw_evidence=_PURGE_RAW_EVIDENCE,
         ),
         RetentionPolicy(
             policy_id="mailtrace-sensitive",
             name="MailTrace Sensitive Evidence Policy",
             classification="SENSITIVE",
-            retention_days=730,
+            retention_days=_configured_retention_days("MAILTRACE_RETENTION_DAYS_SENSITIVE", 730),
             legal_hold_allowed=True,
             forensic_hold_allowed=True,
             purge_derived_views=True,
-            purge_raw_evidence=False,
+            purge_raw_evidence=_PURGE_RAW_EVIDENCE,
         ),
         RetentionPolicy(
             policy_id="mailtrace-restricted",
             name="MailTrace Restricted Evidence Policy",
             classification="RESTRICTED",
-            retention_days=1095,
+            retention_days=_configured_retention_days("MAILTRACE_RETENTION_DAYS_RESTRICTED", 1095),
             legal_hold_allowed=True,
             forensic_hold_allowed=True,
             purge_derived_views=True,
-            purge_raw_evidence=False,
+            purge_raw_evidence=_PURGE_RAW_EVIDENCE,
         ),
     ],
 )
@@ -546,7 +720,6 @@ def _build_evidence_governance(
     filename: str,
     investigation_id: str,
     analysis_result: dict,
-    tenant_id: str | None = None,
 ):
     evidence_id = (
         "EV-"
@@ -622,7 +795,6 @@ def _build_evidence_governance(
             "classification": classification,
             "policy_id": policy_id,
             "content_length": len(file_content),
-            "tenant_id": tenant_id,
             "analysis_binding": {
                 "investigation_id": investigation_id,
                 "analysis_version": "0.1.0",
@@ -853,18 +1025,29 @@ def root():
 # HEALTH CHECK
 # =========================================================
 
-@app.get("/api/health")
-def health_check():
+@app.get("/api/auth/config")
+def public_oidc_config():
+    return oidc_public_client_config()
 
+
+@app.get("/api/auth/me")
+def current_authenticated_identity(request: Request):
+    principal = getattr(request.state, "principal", None)
+    if principal is None or not principal.subject_id or not principal.tenant_id:
+        raise HTTPException(status_code=401, detail="Authentication required.")
     return {
-        "status": "ok",
-        "service": "MailTrace AI Backend",
+        "subject_id": principal.subject_id,
+        "tenant_id": principal.tenant_id,
+        "roles": sorted(principal.roles),
+        "auth_method": getattr(principal, "auth_method", "api_key"),
+        "region": getattr(principal, "region", None),
+        "team": getattr(principal, "team", None),
     }
 
 
-@app.get("/api/live")
-def liveness_check():
-    """Return process liveness without checking external dependencies."""
+@app.get("/api/health")
+def health_check():
+
     return {
         "status": "ok",
         "service": "MailTrace AI Backend",
@@ -896,6 +1079,15 @@ def readiness_check():
         "status": "ok",
         "service": "MailTrace AI Backend",
         "dependencies": {"database": "ok"},
+        "optional_integrations": {
+            "attachment_scanner": clamav_health_status(),
+            "recipient_region_routing": (
+                "READY" if recipient_routing_key_configured() else "CENTRAL_FALLBACK_ONLY"
+            ),
+        },
+        "deployment_constraints": {
+            "tenant_scope": "SINGLE_TENANT_ENFORCED" if is_production() else "DEVELOPMENT_MODE"
+        },
     }
 
 
@@ -913,7 +1105,8 @@ def get_report_map_view(investigation_id: str, request: Request):
     stored analysis contains reliable latitude/longitude values.
     """
     try:
-        investigation = get_investigation(investigation_id)
+        principal = getattr(request.state, "principal", None)
+        investigation = get_investigation(investigation_id, principal.tenant_id if principal else None)
         if investigation is None:
             raise HTTPException(status_code=404, detail="Investigation not found.")
 
@@ -979,12 +1172,13 @@ def get_report_map_view(investigation_id: str, request: Request):
 # CASES
 # =========================================================
 
-@app.get("/api/cases")
-def get_cases(request: Request):
+@app.get("/api/cases/derived-high-risk")
+def get_derived_high_risk_cases(request: Request):
 
     try:
 
-        investigations = get_all_investigations(_request_tenant_id(request))
+        principal = getattr(request.state, "principal", None)
+        investigations = get_all_investigations(principal.tenant_id if principal else None)
 
         cases = []
 
@@ -1099,7 +1293,8 @@ def get_cases(request: Request):
 @app.get("/api/campaigns")
 def get_campaigns(request: Request):
     try:
-        campaigns = correlate_campaigns(get_all_investigations(_request_tenant_id(request)))
+        principal = getattr(request.state, "principal", None)
+        campaigns = correlate_campaigns(get_all_investigations(principal.tenant_id if principal else None))
         return {"success": True, "count": len(campaigns), "campaigns": campaigns}
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Failed to load campaigns: {str(error)}")
@@ -1113,7 +1308,9 @@ def get_campaigns(request: Request):
 def get_campaign_detail(campaign_id: str, request: Request):
     try:
         campaign = next(
-            (item for item in correlate_campaigns(get_all_investigations(_request_tenant_id(request)))
+            (item for item in correlate_campaigns(get_all_investigations(
+                getattr(getattr(request.state, "principal", None), "tenant_id", None)
+            ))
              if item["campaign_id"] == campaign_id),
             None,
         )
@@ -2050,7 +2247,7 @@ async def ingest_email_webhook(request: Request):
         separators=(",", ":"),
     ).encode("utf-8") + b"\n" + bytes(content)
     fingerprint = hashlib.sha256(fingerprint_bytes).hexdigest()
-    delivery = begin_email_webhook_event(event_id, fingerprint, _request_tenant_id(request))
+    delivery = begin_email_webhook_event(event_id, fingerprint)
 
     if delivery["status"] == "conflict":
         raise HTTPException(
@@ -2062,7 +2259,7 @@ async def ingest_email_webhook(request: Request):
             prior_decision = json.loads(delivery.get("policy_decision_json") or "null")
         except (TypeError, json.JSONDecodeError):
             prior_decision = None
-        prior_alert = get_email_alert_by_event(event_id, _request_tenant_id(request))
+        prior_alert = get_email_alert_by_event(event_id)
         try:
             prior_notice = json.loads(prior_alert.get("user_notice_json") or "null") if prior_alert else None
         except (TypeError, json.JSONDecodeError):
@@ -2075,6 +2272,7 @@ async def ingest_email_webhook(request: Request):
             "attempts": delivery["attempts"],
             "investigation_id": delivery["investigation_id"],
             "mail_flow_decision": prior_decision,
+            "gateway_action": get_email_gateway_action_state(event_id),
             "alert": ({
                 "alert_id": prior_alert["alert_id"],
                 "case_id": prior_alert.get("case_id"),
@@ -2108,7 +2306,11 @@ async def ingest_email_webhook(request: Request):
         delivery["lease_token"],
     )
     try:
-        analysis_response = await _analyze_email(uploaded_email, smtp_context)
+        analysis_response = await _analyze_email(
+            uploaded_email,
+            smtp_context,
+            tenant_id=os.getenv("MAILTRACE_WEBHOOK_TENANT_ID", "").strip() or None,
+        )
         investigation_id = analysis_response.get("investigation_id")
         if not investigation_id:
             raise RuntimeError("Analysis completed without an investigation ID.")
@@ -2124,14 +2326,53 @@ async def ingest_email_webhook(request: Request):
                 recommended_action=decision["recommended_action"],
                 policy_version=decision["policy_version"],
                 user_notice=decision.get("user_notification"),
-                tenant_id=_request_tenant_id(request),
+                lease_token=delivery["lease_token"],
             )
+            if alert is None:
+                # The processing lease changed before the alert/case transaction
+                # acquired its lock. The current owner will finish this event.
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "success": True,
+                        "event_id": event_id,
+                        "status": "processing",
+                        "duplicate": True,
+                        "attempts": delivery["attempts"],
+                    },
+                )
+            webhook_tenant = os.getenv("MAILTRACE_WEBHOOK_TENANT_ID", "local").strip()
+            if webhook_tenant and get_case_routing(alert["case_id"], webhook_tenant) is None:
+                try:
+                    trusted_recipients = [
+                        address.strip().casefold()
+                        for _, address in getaddresses([
+                            str(smtp_context.get("recipient") or "")
+                            if isinstance(smtp_context, dict)
+                            else ""
+                        ])
+                        if address and "@" in address
+                    ]
+                    # Route regionally only when the signed SMTP envelope has
+                    # exactly one recipient with an admin-configured mapping.
+                    # Multi-recipient deliveries deliberately use central SOC.
+                    routing_recipient = trusted_recipients[0] if len(trusted_recipients) == 1 else None
+                    route_case_to_soc(
+                        alert["case_id"], webhook_tenant, "",
+                        recipient_email=routing_recipient,
+                        actor_subject="system:mail-gateway",
+                        required_skills=["phishing"] if decision["severity"] in {"HIGH", "CRITICAL"} else [],
+                    )
+                except Exception:
+                    api_logger.exception(
+                        "gateway_case_routing_pending tenant_id=%s case_id=%s",
+                        webhook_tenant, alert["case_id"],
+                    )
         finalized = complete_email_webhook_event(
             event_id,
             investigation_id,
             delivery["lease_token"],
             decision,
-            _request_tenant_id(request),
         )
         if not finalized:
             # This worker lost its lease while analyzing. Do not report its
@@ -2153,6 +2394,7 @@ async def ingest_email_webhook(request: Request):
             "attempts": delivery["attempts"],
         }
         analysis_response["mail_flow_decision"] = decision
+        analysis_response["gateway_action"] = get_email_gateway_action_state(event_id)
         analysis_response["alert"] = ({
             "alert_id": alert["alert_id"],
             "case_id": alert.get("case_id"),
@@ -2166,7 +2408,6 @@ async def ingest_email_webhook(request: Request):
             event_id,
             f"HTTP_{error.status_code}:{type(error).__name__}",
             delivery["lease_token"],
-            _request_tenant_id(request),
         )
         raise HTTPException(
             status_code=error.status_code,
@@ -2180,10 +2421,7 @@ async def ingest_email_webhook(request: Request):
         )
     except Exception as error:
         fail_email_webhook_event(
-            event_id,
-            type(error).__name__,
-            delivery["lease_token"],
-            _request_tenant_id(request),
+            event_id, type(error).__name__, delivery["lease_token"]
         )
         raise HTTPException(
             status_code=500,
@@ -2212,6 +2450,70 @@ class EmployeeEmailReportSubmission(BaseModel):
     employee_note: str = Field(default="", max_length=1000)
 
 
+class GatewayActionReceipt(BaseModel):
+    timestamp: int = Field(ge=0)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    action: Literal["ALLOW", "REVIEW", "QUARANTINE"]
+    outcome: Literal["APPLIED", "FAILED", "OBSERVED"]
+    gateway_message_id: str | None = Field(default=None, max_length=200)
+    reason_code: str | None = Field(default=None, max_length=80)
+
+
+class EvidenceRetentionHolds(BaseModel):
+    legal_hold: bool
+    forensic_hold: bool
+
+
+@app.post("/api/webhooks/email/{event_id}/action-receipt")
+def acknowledge_gateway_action(
+    event_id: str,
+    payload: GatewayActionReceipt,
+    request: Request,
+):
+    """Accept the gateway's signed result after it applies the policy action."""
+    secret = os.getenv("MAILTRACE_GATEWAY_ACK_SECRET", "")
+    if len(secret) < 32:
+        raise HTTPException(status_code=503, detail="Gateway action receipts are disabled.")
+    if abs(int(datetime.now(timezone.utc).timestamp()) - payload.timestamp) > 300:
+        raise HTTPException(status_code=401, detail="Gateway receipt timestamp is outside the 5-minute validity window.")
+    if (
+        len(event_id) > 128
+        or not event_id
+        or any(not (char.isascii() and (char.isalnum() or char in "._:-")) for char in event_id)
+        or any(not (char.isascii() and (char.isalnum() or char in "._:-")) for char in payload.idempotency_key)
+    ):
+        raise HTTPException(status_code=400, detail="Gateway receipt identifiers are malformed.")
+    for value in (payload.gateway_message_id, payload.reason_code):
+        if value and ("\r" in value or "\n" in value or "\x00" in value):
+            raise HTTPException(status_code=400, detail="Gateway receipt metadata is malformed.")
+
+    supplied = request.headers.get("X-MailTrace-Signature", "")
+    if not verify_gateway_action_signature(
+        event_id, payload.model_dump(mode="json", exclude_none=True), secret, supplied
+    ):
+        raise HTTPException(status_code=401, detail="Invalid gateway receipt signature.")
+
+    result = record_email_gateway_action(
+        event_id,
+        payload.idempotency_key,
+        payload.action,
+        payload.outcome,
+        payload.gateway_message_id,
+        payload.reason_code,
+    )
+    if result["status"] == "not_ready":
+        raise HTTPException(status_code=404, detail="Completed webhook delivery was not found.")
+    if result["status"] == "invalid_decision":
+        raise HTTPException(status_code=409, detail="Stored delivery decision is unavailable.")
+    if result["status"] in {"action_mismatch", "outcome_mismatch", "idempotency_conflict", "already_applied"}:
+        raise HTTPException(status_code=409, detail=f"Gateway receipt rejected: {result['status']}.")
+    return {
+        "success": True,
+        "duplicate": result["status"] == "duplicate",
+        "gateway_action": get_email_gateway_action_state(event_id),
+    }
+
+
 def _require_employee_principal(request: Request):
     principal = getattr(request.state, "principal", None)
     if (
@@ -2224,11 +2526,30 @@ def _require_employee_principal(request: Request):
     return principal
 
 
+def _employee_report_status_view(report: dict) -> dict:
+    """Return only the reporter's own case progress; never expose SOC routing data."""
+    raw_status = str(report.get("status") or "OPEN").strip().upper()
+    if raw_status in {"CLOSED", "RESOLVED"}:
+        status = "CLOSED"
+    elif raw_status in {"IN_PROGRESS", "INVESTIGATING", "ASSIGNED"}:
+        status = "UNDER_REVIEW"
+    else:
+        status = "RECEIVED"
+    return {
+        "report_id": report.get("report_id"),
+        "incident_type": report.get("incident_type"),
+        "priority": report.get("priority"),
+        "status": status,
+        "created_at": report.get("created_at"),
+        "updated_at": report.get("updated_at"),
+    }
+
+
 @app.post("/api/employee/reports")
 def submit_employee_report(payload: EmployeeEmailReportSubmission, request: Request):
     """Report only a message addressed to the authenticated employee mailbox."""
     principal = _require_employee_principal(request)
-    investigation = get_investigation(payload.investigation_id)
+    investigation = get_investigation(payload.investigation_id, principal.tenant_id)
     if investigation is None:
         raise HTTPException(status_code=404, detail="Message not found for this employee account.")
     recipients = {
@@ -2258,30 +2579,34 @@ def submit_employee_report(payload: EmployeeEmailReportSubmission, request: Requ
             headers={"Retry-After": "3600"},
         )
     report, created = result
-    routing = None
-    routing_error = None
-    case_id = report.get("case_id") if isinstance(report, dict) else None
-    if case_id:
+    routing = get_case_routing(report["case_id"], principal.tenant_id)
+    if routing is None:
+        required_skills = {
+            "suspicious": ["phishing"],
+            "clicked_link": ["phishing", "url-analysis"],
+            "opened_attachment": ["malware-analysis"],
+            "shared_credentials": ["bec", "incident-response"],
+            "made_payment": ["bec", "incident-response"],
+        }.get(payload.incident_type, ["phishing"])
         try:
-            from services.case_routing import route_employee_case
-            routing = route_employee_case(
-                case_id=case_id,
-                tenant_id=principal.tenant_id,
-                reporter_subject=principal.subject_id,
+            routing = route_case_to_soc(
+                report["case_id"], principal.tenant_id, principal.subject_id,
+                actor_subject=principal.subject_id, required_skills=required_skills,
             )
-        except Exception as error:
-            # Reporting must not fail just because SOC routing is temporarily unavailable.
-            # The case remains visible for SOC recovery/reconciliation.
-            routing_error = str(error)[:300]
-    response_payload = {"success": True, "duplicate": not created, "report": report}
-    if routing is not None:
-        response_payload["routing"] = routing
-    if routing_error is not None:
-        response_payload["routing_status"] = "UNROUTED"
-        response_payload["routing_error"] = routing_error
+        except Exception:
+            # The employee report is durable; the periodic queue reconciler retries routing.
+            api_logger.exception(
+                "employee_case_routing_pending tenant_id=%s case_id=%s",
+                principal.tenant_id, report["case_id"],
+            )
     return JSONResponse(
         status_code=201 if created else 200,
-        content=response_payload,
+        content={
+            "success": True,
+            "duplicate": not created,
+            "report": _employee_report_status_view(report),
+            "routing_status": "RECEIVED_BY_SECURITY_TEAM" if routing else "ROUTING_PENDING",
+        },
     )
 
 
@@ -2291,7 +2616,8 @@ def list_my_employee_reports(request: Request, limit: int = 50):
     reports = get_employee_email_reports(
         principal.tenant_id, principal.subject_id, limit
     )
-    return {"success": True, "count": len(reports), "reports": reports}
+    safe_reports = [_employee_report_status_view(report) for report in reports]
+    return {"success": True, "count": len(safe_reports), "reports": safe_reports}
 
 
 @app.get("/api/employee/reports/{report_id}")
@@ -2302,7 +2628,7 @@ def get_my_employee_report(report_id: str, request: Request):
     )
     if report is None:
         raise HTTPException(status_code=404, detail="Report not found.")
-    return {"success": True, "report": report}
+    return {"success": True, "report": _employee_report_status_view(report)}
 
 
 @app.get("/api/alerts")
@@ -2311,7 +2637,7 @@ def list_security_alerts(limit: int = 100, status: str | None = None):
     normalized_status = status.strip().upper() if status else None
     if normalized_status and normalized_status not in {"NEW", "ACKNOWLEDGED", "RESOLVED"}:
         raise HTTPException(status_code=400, detail="Unsupported alert status filter.")
-    alerts = get_email_alerts(limit=limit, status=normalized_status, tenant_id=principal.tenant_id if principal else None)
+    alerts = get_email_alerts(limit=limit, status=normalized_status)
     for alert in alerts:
         try:
             alert["user_notification"] = json.loads(alert.pop("user_notice_json") or "null")
@@ -2325,7 +2651,7 @@ def acknowledge_security_alert(alert_id: str, request: Request):
     """Persist analyst acknowledgement on the server instead of browser storage."""
     principal = getattr(request.state, "principal", None)
     actor = f"tenant:{principal.tenant_id}" if principal else "local-loopback-analyst"
-    alert = acknowledge_email_alert(alert_id, actor, principal.tenant_id if principal else None)
+    alert = acknowledge_email_alert(alert_id, actor)
     if alert is None:
         raise HTTPException(status_code=404, detail="Security alert not found.")
     return {"success": True, "alert": alert}
@@ -2339,11 +2665,33 @@ def get_security_alert_history(alert_id: str):
     return {"success": True, "alert_id": alert_id, "events": events}
 
 
+@app.get("/api/alerts/{alert_id}/gateway-action-integrity")
+def get_gateway_action_integrity(alert_id: str):
+    """Show whether the gateway reported applying the action and verify receipt integrity."""
+    connection = get_connection()
+    try:
+        row = connection.execute(
+            "SELECT event_id FROM email_alerts WHERE alert_id=?",
+            (alert_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Security alert not found.")
+    event_id = str(row["event_id"])
+    return {
+        "success": True,
+        "alert_id": alert_id,
+        "gateway_action": get_email_gateway_action_state(event_id),
+        "integrity": verify_email_gateway_action_chain(event_id),
+    }
+
+
 @app.post("/api/alerts/{alert_id}/resolve")
 def resolve_security_alert(alert_id: str, request: Request):
     principal = getattr(request.state, "principal", None)
     actor = f"tenant:{principal.tenant_id}" if principal else "local-loopback-analyst"
-    alert = resolve_email_alert(alert_id, actor, principal.tenant_id if principal else None)
+    alert = resolve_email_alert(alert_id, actor)
     if alert is None:
         raise HTTPException(status_code=404, detail="Security alert not found.")
     return {"success": True, "alert": alert}
@@ -2351,14 +2699,17 @@ def resolve_security_alert(alert_id: str, request: Request):
 
 @app.post("/api/analyze-email")
 async def analyze_email(
+    request: Request,
     file: UploadFile = File(...),
 ):
-    return await _analyze_email(file)
+    principal = getattr(request.state, "principal", None)
+    return await _analyze_email(file, tenant_id=principal.tenant_id if principal else None)
 
 
 async def _analyze_email(
     file: UploadFile,
     trusted_smtp_context: dict[str, str] | None = None,
+    tenant_id: str | None = None,
 ):
 
     # -----------------------------------------
@@ -2516,7 +2867,7 @@ async def _analyze_email(
             forensic_input,
             verify_authentication=not file.filename.lower().endswith(".msg"),
             smtp_context=(
-                ({key: value for key, value in trusted_smtp_context.items() if key != "recipient"} or None) if isinstance(trusted_smtp_context, dict) else None
+                ({key: value for key, value in trusted_smtp_context.items() if key != "recipient"} or None)
                 if not file.filename.lower().endswith(".msg")
                 else None
             ),
@@ -2690,6 +3041,7 @@ async def _analyze_email(
             "matched_count": 0,
             "status": "no_iocs",
         }
+        ioc_values = []
 
         try:
             email_body = (
@@ -2719,7 +3071,6 @@ async def _analyze_email(
                 matches = lookup_threat_intelligence_batch(
                     ioc_values,
                     limit_per_ioc=20,
-                    tenant_id=_request_tenant_id(request),
                 )
 
                 threat_intelligence["matches"] = matches
@@ -2736,6 +3087,33 @@ async def _analyze_email(
         except Exception as ioc_error:
             threat_intelligence["status"] = "error"
             threat_intelligence["error"] = str(ioc_error)
+
+        try:
+            source_provenance = get_threat_intelligence_source_status()
+        except Exception as provenance_error:
+            source_provenance = {
+                "checked_at_utc": _mailtrace_utc_now(),
+                "freshness_window_hours": 24,
+                "coverage_status": "STATUS_UNAVAILABLE",
+                "providers": {},
+                "status_error_type": type(provenance_error).__name__,
+            }
+        threat_intelligence["source_provenance"] = {
+            **source_provenance,
+            "lookup_mode": "LOCAL_CACHED_FEEDS",
+            "live_per_indicator_lookup": False,
+            "lookup_checked_at_utc": _mailtrace_utc_now(),
+        }
+        threat_intelligence["coverage_status"] = source_provenance.get(
+            "coverage_status", "STATUS_UNAVAILABLE"
+        )
+        if (
+            ioc_values
+            and not threat_intelligence.get("matches")
+            and threat_intelligence["status"] in {"no_matches", "no_iocs"}
+            and threat_intelligence["coverage_status"] != "FRESH"
+        ):
+            threat_intelligence["status"] = "coverage_limited"
 
         result["threat_intelligence"] = (
             threat_intelligence
@@ -2863,36 +3241,69 @@ async def _analyze_email(
         result["threat_analysis"]["rule_score"] = rule_threat_score
         result["threat_analysis"]["score"] = combined_threat_score
         result["threat_analysis"]["score_source"] = score_source
-
+        
                 # -------------------------------------
         # UPDATE VERDICT / CONFIDENCE
         # -------------------------------------
 
         if combined_threat_score >= 90:
-
             result["threat_analysis"]["verdict"] = "CRITICAL"
-            result["threat_analysis"]["confidence"] = "HIGH"
-
-        elif combined_threat_score >= 75:
-
-            result["threat_analysis"]["verdict"] = "HIGH RISK"
-            result["threat_analysis"]["confidence"] = "HIGH"
-
         elif combined_threat_score >= 50:
-
             result["threat_analysis"]["verdict"] = "HIGH RISK"
-            result["threat_analysis"]["confidence"] = "HIGH"
-
         elif combined_threat_score >= 30:
-
             result["threat_analysis"]["verdict"] = "SUSPICIOUS"
-            result["threat_analysis"]["confidence"] = "MEDIUM"
-
         else:
-
             result["threat_analysis"]["verdict"] = "LOW RISK"
-            result["threat_analysis"]["confidence"] = "LOW"
 
+        # Confidence is evidence support, not another spelling of the risk score.
+        # Only the analyzed fusion result can qualify an automatic quarantine.
+        try:
+            fusion_confidence = float(intelligence_fusion.get("confidence"))
+            fusion_evidence_confidence = float(intelligence_fusion.get("evidence_confidence"))
+            fusion_signal_count = int(intelligence_fusion.get("signal_count", 0))
+            independent_evidence_count = int(
+                intelligence_fusion.get("fusion_metrics", {}).get("independent_category_count", 0)
+            )
+        except (TypeError, ValueError, AttributeError):
+            fusion_confidence = -1.0
+            fusion_evidence_confidence = -1.0
+            fusion_signal_count = 0
+            independent_evidence_count = 0
+        fusion_decision = str(intelligence_fusion.get("decision", "UNKNOWN")).upper()
+        fusion_confidence_valid = (
+            score_source == "intelligence_fusion"
+            and intelligence_fusion.get("status") == "ANALYZED"
+            and 0.0 <= fusion_confidence <= 1.0
+            and 0.0 <= fusion_evidence_confidence <= 1.0
+            and fusion_signal_count > 0
+        )
+        high_confidence_supported = (
+            fusion_confidence_valid
+            and fusion_decision in {"HIGH_CONFIDENCE_THREAT", "CORROBORATED_THREAT"}
+            and fusion_confidence >= 0.80
+            and fusion_evidence_confidence >= 0.70
+            and fusion_signal_count >= 5
+            and independent_evidence_count >= 2
+        )
+        if not fusion_confidence_valid:
+            confidence_label = "UNKNOWN"
+        elif high_confidence_supported:
+            confidence_label = "HIGH"
+        elif fusion_confidence >= 0.65 and fusion_evidence_confidence >= 0.45:
+            confidence_label = "MEDIUM"
+        else:
+            confidence_label = "LOW"
+
+        result["threat_analysis"].update({
+            "confidence": confidence_label,
+            "confidence_basis": "intelligence_fusion" if fusion_confidence_valid else "unavailable",
+            "confidence_value": fusion_confidence if fusion_confidence_valid else None,
+            "evidence_confidence": fusion_evidence_confidence if fusion_confidence_valid else None,
+            "confidence_decision": fusion_decision,
+            "supporting_signal_count": fusion_signal_count if fusion_confidence_valid else 0,
+            "independent_evidence_count": independent_evidence_count if fusion_confidence_valid else 0,
+        })
+  
          # -------------------------------------
         # BASIC INFORMATION
         # -------------------------------------
@@ -2929,11 +3340,16 @@ async def _analyze_email(
             filename=file.filename,
             investigation_id=investigation_id,
             analysis_result=result,
-            tenant_id=_request_tenant_id(request),
         )
 
         result["evidence_governance"] = (
             evidence_governance
+        )
+        retention_decision = evidence_governance.get("retention") or {}
+        retention_policy = (
+            privacy_governance.get_policy(retention_decision.get("policy_id"))
+            if retention_decision.get("policy_id")
+            else None
         )
 
         # -------------------------------------
@@ -2941,7 +3357,6 @@ async def _analyze_email(
         # -------------------------------------
 
         save_investigation(
-            tenant_id=_request_tenant_id(request),
 
             investigation_id=investigation_id,
 
@@ -2983,6 +3398,12 @@ async def _analyze_email(
                 if isinstance(trusted_smtp_context, dict)
                 else None
             ),
+            tenant_id=tenant_id,
+            retention_classification=retention_decision.get("classification"),
+            retention_policy_id=retention_decision.get("policy_id"),
+            retention_expires_at=retention_decision.get("expires_at_utc"),
+            retention_purge_derived=(retention_policy.purge_derived_views if retention_policy else False),
+            retention_purge_raw=(retention_policy.purge_raw_evidence if retention_policy else False),
         )
 
         # -------------------------------------
@@ -3018,15 +3439,52 @@ async def _analyze_email(
 # EVIDENCE / PRIVACY / INTEGRITY API
 # =========================================================
 
-def _require_evidence_tenant_access(evidence_id: str, request: Request):
-    record = evidence_custody.get(evidence_id)
+@app.get("/api/privacy/retention/{investigation_id}")
+def get_retention_details(investigation_id: str, request: Request):
     principal = getattr(request.state, "principal", None)
-    tenant_id = getattr(principal, "tenant_id", "__local__")
-    owner = (record.core_metadata or {}).get("tenant_id")
-    if owner != tenant_id:
-        raise HTTPException(status_code=404, detail="Evidence not found.")
-    return record
+    if principal is None:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    state = get_evidence_retention_state(principal.tenant_id, investigation_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Investigation retention record not found.")
+    state["derived_data_purge_requested"] = bool(state.get("retention_purge_derived"))
+    state["raw_evidence_purge_requested"] = bool(state.get("retention_purge_raw"))
+    state["retention_purge_completed"] = bool(state.get("retention_purged_at"))
+    if state["retention_purge_completed"]:
+        state["worker_behavior"] = "RETENTION_PURGE_COMPLETED"
+    elif state["raw_evidence_purge_requested"]:
+        state["worker_behavior"] = "RAW_EVIDENCE_PURGE_PENDING_POLICY_AND_HOLD_CHECKS"
+    elif state["derived_data_purge_requested"]:
+        state["worker_behavior"] = "DERIVED_DATA_PURGE_PENDING_POLICY_AND_HOLD_CHECKS"
+    else:
+        state["worker_behavior"] = "RETENTION_ONLY"
+    return {"success": True, "retention": state}
 
+
+@app.put("/api/privacy/retention/{investigation_id}/holds")
+def update_retention_holds(
+    investigation_id: str,
+    payload: EvidenceRetentionHolds,
+    request: Request,
+):
+    principal = getattr(request.state, "principal", None)
+    if principal is None or "tenant_admin" not in principal.roles:
+        raise HTTPException(status_code=403, detail="Tenant administrator role is required to change evidence holds.")
+    if is_production() and getattr(principal, "auth_method", "api_key") != "oidc":
+        raise HTTPException(status_code=403, detail="Production retention holds require a verified OIDC identity.")
+    try:
+        state = set_evidence_retention_holds(
+            principal.tenant_id,
+            investigation_id,
+            principal.subject_id or "unknown-admin",
+            payload.legal_hold,
+            payload.forensic_hold,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if state is None:
+        raise HTTPException(status_code=404, detail="Investigation retention record not found.")
+    return {"success": True, "retention": state}
 
 @app.get("/api/evidence/{evidence_id}")
 def get_evidence_record(
@@ -3034,7 +3492,17 @@ def get_evidence_record(
     request: Request,
 ):
     try:
-        record = _require_evidence_tenant_access(evidence_id, request)
+        record = evidence_custody.get(
+            evidence_id
+        )
+        principal = getattr(request.state, "principal", None)
+        investigation_id = getattr(record, "investigation_id", None)
+        if (
+            principal is None
+            or not investigation_id
+            or get_investigation(investigation_id, principal.tenant_id) is None
+        ):
+            raise HTTPException(status_code=404, detail="Evidence not found.")
 
         verification = evidence_custody.verify(
             evidence_id
@@ -3058,6 +3526,8 @@ def get_evidence_record(
             ],
         }
 
+    except HTTPException:
+        raise
     except Exception as error:
         raise HTTPException(
             status_code=404,
@@ -3074,8 +3544,18 @@ def verify_evidence_integrity(
     request: Request,
 ):
     try:
-        _require_evidence_tenant_access(evidence_id, request)
-        custody = evidence_custody.verify(evidence_id)
+        record = evidence_custody.get(evidence_id)
+        principal = getattr(request.state, "principal", None)
+        investigation_id = getattr(record, "investigation_id", None)
+        if (
+            principal is None
+            or not investigation_id
+            or get_investigation(investigation_id, principal.tenant_id) is None
+        ):
+            raise HTTPException(status_code=404, detail="Evidence not found.")
+        custody = evidence_custody.verify(
+            evidence_id
+        )
 
         anchors = integrity_anchoring.list_anchors(
             evidence_id=evidence_id
@@ -3108,6 +3588,8 @@ def verify_evidence_integrity(
             "integrity": anchor_checks,
         }
 
+    except HTTPException:
+        raise
     except Exception as error:
         raise HTTPException(
             status_code=404,
@@ -3181,7 +3663,8 @@ def get_live_threat_intelligence(request: Request):
 
     try:
 
-        investigations = get_all_investigations(_request_tenant_id(request))
+        principal = getattr(request.state, "principal", None)
+        investigations = get_all_investigations(principal.tenant_id if principal else None)
 
         events = []
 
@@ -3377,7 +3860,7 @@ async def stream_live_threat_intelligence(request: Request):
                 )
                 if current_key != previous_key:
                     snapshot = await asyncio.to_thread(
-                        get_live_threat_intelligence, request
+                        get_live_threat_intelligence
                     )
                     events = snapshot.get("events", [])
                     latest = events[0] if events else {}
@@ -3432,3 +3915,11 @@ if __name__ == "__main__":
         port=8000,
         reload=True
     )
+
+
+
+
+
+
+
+

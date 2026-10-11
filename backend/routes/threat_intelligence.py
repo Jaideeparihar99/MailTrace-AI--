@@ -1,18 +1,16 @@
-"""
+﻿"""
 MailTrace AI — Threat Intelligence API
 """
 
 from fastapi import APIRouter, HTTPException, Request
 
-from services.threat_intelligence import (
-    ThreatIntelligenceEngine,
-)
-
 from database.database import (
     initialize_threat_intelligence_table,
-    save_threat_intelligence,
     get_threat_intelligence,
+    get_threat_intelligence_source_status,
 )
+from services.threat_intelligence import ThreatIntelligenceEngine
+from services.threat_intelligence.sync_service import sync_threat_intelligence_feeds
 
 
 router = APIRouter(
@@ -35,13 +33,14 @@ def threat_intelligence_status():
         "service": "threat-intelligence",
         "providers":
             ThreatIntelligenceEngine.provider_status(),
+        "feed_freshness": get_threat_intelligence_source_status(),
     }
 
 
 @router.post("/sync")
 def threat_intelligence_sync(
+    request: Request,
     days: int = 1,
-    request: Request = None,
 ):
 
     if days < 1:
@@ -50,39 +49,16 @@ def threat_intelligence_sync(
     if days > 7:
         days = 7
 
-    result = ThreatIntelligenceEngine.sync(
+    principal = getattr(getattr(request, "state", None), "principal", None)
+    return sync_threat_intelligence_feeds(
         days=days,
+        synced_by=getattr(principal, "subject_id", None),
     )
-
-    saved = save_threat_intelligence(
-        result.get(
-            "indicators",
-            [],
-        ),
-        tenant_id=getattr(getattr(request, "state", None), "principal", None).tenant_id if getattr(getattr(request, "state", None), "principal", None) else None,
-    )
-
-    return {
-        "success": result.get(
-            "success",
-            False,
-        ),
-        "providers": result.get(
-            "providers",
-            {},
-        ),
-        "fetched": result.get(
-            "count",
-            0,
-        ),
-        "saved": saved,
-    }
 
 
 @router.get("/indicators")
 def threat_intelligence_indicators(
     limit: int = 100,
-    request: Request = None,
 ):
 
     limit = max(
@@ -90,10 +66,8 @@ def threat_intelligence_indicators(
         min(int(limit), 500),
     )
 
-    principal = getattr(getattr(request, "state", None), "principal", None)
     indicators = get_threat_intelligence(
         limit=limit,
-        tenant_id=getattr(principal, "tenant_id", None),
     )
 
     return {

@@ -419,7 +419,7 @@ def analyze_attachment(
             ),
             "malware_confirmed": type_metadata.get(
                 "malware_confirmed",
-                False,
+                None,
             ),
             "detection_basis": type_metadata.get("detection_basis"),
             "identity_confidence": type_metadata.get(
@@ -662,3 +662,5 @@ __all__ = [
     "analyze_attachment",
     "analyze_attachment_to_dict",
 ]
+
+
