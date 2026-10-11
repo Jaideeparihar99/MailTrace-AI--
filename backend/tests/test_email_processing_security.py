@@ -164,6 +164,37 @@ class EmailProcessingSecurityTests(unittest.TestCase):
         self.assertEqual(parsed["basic_information"]["subject"], "Test")
         self.assertEqual(parsed["body"]["text"], "A routine message.")
 
+    def test_readiness_discloses_unconfigured_gateway_and_identity_integrations(self):
+        import main
+
+        with (
+            patch.object(main, "is_production", return_value=False),
+            patch.object(main, "oidc_is_configured", return_value=False),
+            patch.object(main, "oidc_public_client_config", return_value={"enabled": False}),
+            patch.dict(
+                os.environ,
+                {
+                    "MAILTRACE_WEBHOOK_SECRET": "",
+                    "MAILTRACE_WEBHOOK_TENANT_ID": "",
+                    "MAILTRACE_GATEWAY_ACK_SECRET": "",
+                },
+            ),
+        ):
+            with TestClient(main.app) as client:
+                response = client.get("/api/ready")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        optional = payload["optional_integrations"]
+        self.assertEqual(optional["identity_provider"]["oidc"], "NOT_CONFIGURED")
+        self.assertEqual(optional["mail_gateway"]["generic_webhook_endpoint"], "AVAILABLE")
+        self.assertEqual(optional["mail_gateway"]["vendor_adapter"], "NOT_CONFIGURED")
+        self.assertEqual(optional["mail_gateway"]["webhook_authentication"], "NOT_CONFIGURED")
+        self.assertEqual(optional["mail_gateway"]["tenant_binding"], "NOT_CONFIGURED")
+        self.assertEqual(optional["mail_gateway"]["action_receipts"], "NOT_CONFIGURED")
+        self.assertEqual(optional["integrity_anchoring"]["status"], "LOCAL_TEST_ONLY")
+        self.assertNotIn("MAILTRACE_WEBHOOK_SECRET", json.dumps(payload))
+
     def test_webhook_requires_fresh_hmac_and_sends_raw_email_to_pipeline(self):
         import main
         import database.database as database

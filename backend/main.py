@@ -1093,6 +1093,32 @@ def readiness_check():
                 "READY" if recipient_routing_key_configured() else "CENTRAL_FALLBACK_ONLY"
             ),
             "integrity_anchoring": integrity_anchoring.status(),
+            "identity_provider": {
+                "oidc": (
+                    "READY"
+                    if oidc_is_configured() and oidc_public_client_config().get("enabled")
+                    else "NOT_CONFIGURED"
+                ),
+            },
+            "mail_gateway": {
+                "generic_webhook_endpoint": "AVAILABLE",
+                "vendor_adapter": "NOT_CONFIGURED",
+                "webhook_authentication": (
+                    "CONFIGURED"
+                    if len(os.getenv("MAILTRACE_WEBHOOK_SECRET", "").strip()) >= 32
+                    else "NOT_CONFIGURED"
+                ),
+                "tenant_binding": (
+                    "CONFIGURED"
+                    if os.getenv("MAILTRACE_WEBHOOK_TENANT_ID", "").strip()
+                    else "NOT_CONFIGURED"
+                ),
+                "action_receipts": (
+                    "CONFIGURED"
+                    if len(os.getenv("MAILTRACE_GATEWAY_ACK_SECRET", "").strip()) >= 32
+                    else "NOT_CONFIGURED"
+                ),
+            },
         },
         "deployment_constraints": {
             "tenant_scope": "SINGLE_TENANT_ENFORCED" if is_production() else "DEVELOPMENT_MODE"
