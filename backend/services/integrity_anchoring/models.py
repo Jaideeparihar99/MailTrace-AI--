@@ -45,6 +45,7 @@ class AnchorVerification:
     timestamp_present: bool
     trust_level: str
     issues: tuple[str, ...] = field(default_factory=tuple)
+    anchored_at_utc: str | None = None
 
 
 @dataclass(frozen=True)

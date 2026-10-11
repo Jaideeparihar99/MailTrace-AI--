@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import sqlite3
+import threading
+from pathlib import Path
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
@@ -58,10 +61,135 @@ class IntegrityAnchorEngine:
         self,
         *,
         providers: dict[str, AnchorProvider] | None = None,
+        storage_path: str | Path | None = None,
     ) -> None:
         self._providers = dict(providers or {})
         self._requests: dict[str, AnchorRequest] = {}
         self._receipts: dict[str, AnchorReceipt] = {}
+        self.storage_path = Path(storage_path) if storage_path is not None else None
+        self._guard = threading.RLock()
+        if self.storage_path is not None:
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+            self._initialize_storage()
+            self._refresh_from_storage()
+
+    def _connect(self) -> sqlite3.Connection:
+        if self.storage_path is None:
+            raise IntegrityAnchorError("Durable anchor storage is not configured.")
+        connection = sqlite3.connect(str(self.storage_path), timeout=15)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=15000")
+        return connection
+
+    def _initialize_storage(self) -> None:
+        connection = None
+        try:
+            connection = self._connect()
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS integrity_anchors (
+                    anchor_id TEXT PRIMARY KEY,
+                    evidence_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    commitment_sha256 TEXT NOT NULL,
+                    requested_at_utc TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    UNIQUE (evidence_id, provider, commitment_sha256)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_integrity_anchors_evidence "
+                "ON integrity_anchors(evidence_id, requested_at_utc)"
+            )
+            connection.commit()
+        except sqlite3.DatabaseError as exc:
+            raise IntegrityAnchorError(
+                "Persisted integrity-anchor ledger could not be initialized."
+            ) from exc
+        finally:
+            if connection is not None:
+                connection.close()
+
+    @staticmethod
+    def _request_json(request: AnchorRequest) -> str:
+        return json.dumps(asdict(request), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+    @staticmethod
+    def _receipt_json(receipt: AnchorReceipt) -> str:
+        payload = asdict(receipt)
+        payload["proof"] = receipt.proof.hex() if receipt.proof is not None else None
+        payload["verification_issues"] = list(receipt.verification_issues)
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+    @staticmethod
+    def _request_from_json(raw: str) -> AnchorRequest:
+        payload = json.loads(raw)
+        return AnchorRequest(**payload)
+
+    @staticmethod
+    def _receipt_from_json(raw: str) -> AnchorReceipt:
+        payload = json.loads(raw)
+        proof = payload.get("proof")
+        payload["proof"] = bytes.fromhex(proof) if proof is not None else None
+        payload["verification_issues"] = tuple(payload.get("verification_issues") or ())
+        return AnchorReceipt(**payload)
+
+    def _refresh_from_storage(self, connection: sqlite3.Connection | None = None) -> None:
+        if self.storage_path is None:
+            return
+        owns_connection = connection is None
+        active = connection or self._connect()
+        try:
+            rows = active.execute(
+                "SELECT anchor_id, request_json, receipt_json FROM integrity_anchors"
+            ).fetchall()
+            requests: dict[str, AnchorRequest] = {}
+            receipts: dict[str, AnchorReceipt] = {}
+            for row in rows:
+                anchor_id = str(row["anchor_id"])
+                request = self._request_from_json(row["request_json"])
+                receipt = self._receipt_from_json(row["receipt_json"])
+                if request.anchor_id != anchor_id or receipt.anchor_id != anchor_id:
+                    raise ValueError("Persisted anchor identifiers do not match the row key.")
+                requests[anchor_id] = request
+                receipts[anchor_id] = receipt
+            self._requests = requests
+            self._receipts = receipts
+        except (sqlite3.DatabaseError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise IntegrityAnchorError(
+                "Persisted integrity-anchor records are corrupt or unreadable."
+            ) from exc
+        finally:
+            if owns_connection:
+                active.close()
+
+    def status(self) -> dict[str, Any]:
+        """Report configured trust boundaries without conflating local proofs with independent anchors."""
+        provider_rows = []
+        for name, provider in sorted(self._providers.items()):
+            trust_level = str(getattr(provider, "trust_level", "UNKNOWN"))
+            independent = bool(getattr(provider, "independent_trust_boundary", trust_level != "LOCAL_TEST_ONLY"))
+            configured = bool(getattr(provider, "is_configured", True))
+            provider_rows.append({
+                "name": name,
+                "trust_level": trust_level,
+                "configured": configured,
+                "independent_trust_boundary": independent,
+                "ready_for_independent_anchor": independent and configured,
+            })
+        external_ready = any(item["ready_for_independent_anchor"] for item in provider_rows)
+        local_available = any(item["name"] == "local" for item in provider_rows)
+        return {
+            "status": "EXTERNAL_READY" if external_ready else ("LOCAL_TEST_ONLY" if local_available else "NOT_CONFIGURED"),
+            "independent_anchor_configured": external_ready,
+            "providers": provider_rows,
+            "storage": "SQLITE_DURABLE" if self.storage_path is not None else "MEMORY_ONLY",
+            "blockchain_ledger": "NOT_CONFIGURED",
+        }
 
     # ---------------------------------------------------------
     # Provider management
@@ -110,12 +238,9 @@ class IntegrityAnchorEngine:
     ) -> AnchorReceipt:
         if not evidence_id:
             raise ValueError("Evidence ID is required.")
-
         if len(evidence_id) > MAX_EVIDENCE_ID_CHARS:
             raise ValueError("Evidence ID is too long.")
-
         metadata = dict(metadata or {})
-
         if len(metadata) > MAX_METADATA_ITEMS:
             raise ValueError("Too many anchor metadata items.")
 
@@ -126,52 +251,74 @@ class IntegrityAnchorEngine:
             chain_anchor_digest=chain_anchor_digest,
             manifest_sha256=manifest_sha256,
         )
-
-        commitment = commitment_sha256(
-            commitment_payload
-        )
-
-        # Idempotency: the same evidence+commitment+provider returns
-        # the already-created receipt instead of generating a duplicate.
-        for existing_id, existing in self._receipts.items():
-            if (
-                existing.evidence_id == evidence_id
-                and existing.provider == provider
-                and existing.commitment_sha256 == commitment
-            ):
-                return existing
-
-        anchor_id = (
-            "anc_"
-            + datetime.now(timezone.utc).strftime(
-                "%Y%m%dT%H%M%S%fZ"
-            )
-            + "_"
-            + secrets.token_hex(8)
-        )
-
-        request = AnchorRequest(
-            anchor_id=anchor_id,
-            evidence_id=evidence_id,
-            commitment_algorithm=SUPPORTED_COMMITMENT_ALGORITHM,
-            commitment_sha256=commitment,
-            commitment_payload=commitment_payload,
-            requested_at_utc=_utc_now(),
-            provider=provider,
-            nonce=secrets.token_hex(16),
-            metadata=metadata,
-        )
-
+        commitment = commitment_sha256(commitment_payload)
         anchor_provider = self.get_provider(provider)
 
-        receipt = anchor_provider.create(
-            request
-        )
+        with self._guard:
+            connection = self._connect() if self.storage_path is not None else None
+            try:
+                if connection is not None:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._refresh_from_storage(connection)
+                for existing in self._receipts.values():
+                    if (
+                        existing.evidence_id == evidence_id
+                        and existing.provider == provider
+                        and existing.commitment_sha256 == commitment
+                    ):
+                        if connection is not None:
+                            connection.commit()
+                        return existing
 
-        self._requests[anchor_id] = request
-        self._receipts[anchor_id] = receipt
-
-        return receipt
+                anchor_id = (
+                    "anc_"
+                    + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                    + "_"
+                    + secrets.token_hex(8)
+                )
+                request = AnchorRequest(
+                    anchor_id=anchor_id,
+                    evidence_id=evidence_id,
+                    commitment_algorithm=SUPPORTED_COMMITMENT_ALGORITHM,
+                    commitment_sha256=commitment,
+                    commitment_payload=commitment_payload,
+                    requested_at_utc=_utc_now(),
+                    provider=provider,
+                    nonce=secrets.token_hex(16),
+                    metadata=metadata,
+                )
+                receipt = anchor_provider.create(request)
+                if (
+                    receipt.anchor_id != anchor_id
+                    or receipt.evidence_id != evidence_id
+                    or receipt.provider != provider
+                    or receipt.commitment_algorithm != SUPPORTED_COMMITMENT_ALGORITHM
+                    or receipt.commitment_sha256 != commitment
+                ):
+                    raise IntegrityAnchorError(
+                        "Anchor provider returned a receipt that does not match the requested evidence commitment."
+                    )
+                if connection is not None:
+                    connection.execute(
+                        """INSERT INTO integrity_anchors
+                        (anchor_id, evidence_id, provider, commitment_sha256, requested_at_utc, request_json, receipt_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            anchor_id, evidence_id, provider, commitment, request.requested_at_utc,
+                            self._request_json(request), self._receipt_json(receipt),
+                        ),
+                    )
+                    connection.commit()
+                self._requests[anchor_id] = request
+                self._receipts[anchor_id] = receipt
+                return receipt
+            except Exception:
+                if connection is not None:
+                    connection.rollback()
+                raise
+            finally:
+                if connection is not None:
+                    connection.close()
 
     # ---------------------------------------------------------
     # Verification
@@ -180,42 +327,45 @@ class IntegrityAnchorEngine:
         self,
         anchor_id: str,
     ) -> AnchorVerification:
-        if anchor_id not in self._requests:
-            raise IntegrityAnchorError(
-                f"Unknown anchor: {anchor_id}"
-            )
-
-        request = self._requests[anchor_id]
-        receipt = self._receipts[anchor_id]
-        provider = self.get_provider(
-            request.provider
-        )
-
-        result = provider.verify(
-            request,
-            receipt,
-        )
-
-        if result.valid:
-            self._receipts[anchor_id] = AnchorReceipt(
-                **{
-                    **asdict(receipt),
-                    "status": "VERIFIED",
-                    "trust_level": result.trust_level,
-                    "verification_state": "VERIFIED",
-                    "verification_issues": result.issues,
-                }
-            )
-        else:
-            self._receipts[anchor_id] = AnchorReceipt(
-                **{
-                    **asdict(receipt),
-                    "verification_state": "FAILED",
-                    "verification_issues": result.issues,
-                }
-            )
-
-        return result
+        with self._guard:
+            connection = self._connect() if self.storage_path is not None else None
+            try:
+                if connection is not None:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._refresh_from_storage(connection)
+                if anchor_id not in self._requests:
+                    raise IntegrityAnchorError(f"Unknown anchor: {anchor_id}")
+                request = self._requests[anchor_id]
+                receipt = self._receipts[anchor_id]
+                provider = self.get_provider(request.provider)
+                result = provider.verify(request, receipt)
+                updated = AnchorReceipt(
+                    **{
+                        **asdict(receipt),
+                        "status": "VERIFIED" if result.valid else receipt.status,
+                        "anchored_at_utc": result.anchored_at_utc or receipt.anchored_at_utc,
+                        "trust_level": result.trust_level,
+                        "verification_state": "VERIFIED" if result.valid else "FAILED",
+                        "verification_issues": result.issues,
+                    }
+                )
+                self._receipts[anchor_id] = updated
+                if connection is not None:
+                    cursor = connection.execute(
+                        "UPDATE integrity_anchors SET receipt_json=? WHERE anchor_id=?",
+                        (self._receipt_json(updated), anchor_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise IntegrityAnchorError("Anchor disappeared while verification was being stored.")
+                    connection.commit()
+                return result
+            except Exception:
+                if connection is not None:
+                    connection.rollback()
+                raise
+            finally:
+                if connection is not None:
+                    connection.close()
 
     # ---------------------------------------------------------
     # Lookup
@@ -224,6 +374,8 @@ class IntegrityAnchorEngine:
         self,
         anchor_id: str,
     ) -> AnchorReceipt:
+        with self._guard:
+            self._refresh_from_storage()
         try:
             return self._receipts[anchor_id]
         except KeyError as exc:
@@ -236,6 +388,8 @@ class IntegrityAnchorEngine:
         *,
         evidence_id: str | None = None,
     ) -> list[AnchorReceipt]:
+        with self._guard:
+            self._refresh_from_storage()
         values = list(
             self._receipts.values()
         )
@@ -256,6 +410,8 @@ class IntegrityAnchorEngine:
         self,
         anchor_id: str,
     ) -> AnchorExport:
+        with self._guard:
+            self._refresh_from_storage()
         if anchor_id not in self._requests:
             raise IntegrityAnchorError(
                 f"Unknown anchor: {anchor_id}"
