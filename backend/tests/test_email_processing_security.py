@@ -129,6 +129,26 @@ class EmailProcessingSecurityTests(unittest.TestCase):
         self.assertEqual(parsed["attachments"][0]["filename"], "sample.bin")
         outlook_message.close.assert_called_once()
 
+    def test_optional_trusted_smtp_context_is_safely_normalized(self):
+        import main
+
+        self.assertIsNone(main._sanitize_forensics_smtp_context(None))
+        self.assertIsNone(main._sanitize_forensics_smtp_context({}))
+        self.assertIsNone(main._sanitize_forensics_smtp_context("not-a-dict"))
+        self.assertEqual(
+            main._sanitize_forensics_smtp_context(
+                {
+                    "client_ip": "8.8.8.8",
+                    "mail_from": "sender@example.invalid",
+                    "recipient": "employee@example.invalid",
+                }
+            ),
+            {
+                "client_ip": "8.8.8.8",
+                "mail_from": "sender@example.invalid",
+            },
+        )
+
     def test_eml_path_still_parses(self):
         parsed = parse_email(
             b"From: analyst@example.invalid\r\n"
@@ -187,7 +207,7 @@ class EmailProcessingSecurityTests(unittest.TestCase):
             })
             return headers
 
-        async def capture(upload, smtp_context=None):
+        async def capture(upload, smtp_context=None, tenant_id=None):
             return {
                 "success": True,
                 "filename": upload.filename,
@@ -268,6 +288,7 @@ class EmailProcessingSecurityTests(unittest.TestCase):
                     database.initialize_database()
                     database.initialize_email_webhook_events()
                     request = Mock()
+                    request.state = Mock(principal=None)
                     request.is_disconnected = AsyncMock(side_effect=[False, True])
                     response = await main.stream_live_threat_intelligence(request)
                     event = await response.body_iterator.__anext__()
@@ -275,6 +296,49 @@ class EmailProcessingSecurityTests(unittest.TestCase):
                     self.assertIn('"success":true', event)
 
         asyncio.run(verify_stream())
+
+    def test_stale_webhook_worker_cannot_create_soc_alert_or_case(self):
+        import database.database as database
+
+        with tempfile.TemporaryDirectory(prefix="mailtrace-stale-owner-") as root:
+            with patch.object(database, "DATABASE_PATH", Path(root) / "test.db"):
+                database.initialize_database()
+                database.initialize_email_webhook_events()
+                database.initialize_email_alerts()
+                old_owner = database.begin_email_webhook_event("stale-owner-event", "a" * 64)
+                connection = database.get_connection()
+                connection.execute(
+                    "UPDATE email_webhook_events SET updated_at=datetime('now', '-20 minutes') WHERE event_id=?",
+                    ("stale-owner-event",),
+                )
+                connection.commit()
+                connection.close()
+
+                current_owner = database.begin_email_webhook_event("stale-owner-event", "a" * 64)
+                stale_result = database.create_email_alert(
+                    event_id="stale-owner-event",
+                    investigation_id="INV-STALE-WORKER",
+                    severity="CRITICAL",
+                    threat_score=100,
+                    confidence="high",
+                    recommended_action="quarantine",
+                    tenant_id="local",
+                    lease_token=old_owner["lease_token"],
+                )
+                connection = database.get_connection()
+                alert_count = connection.execute(
+                    "SELECT COUNT(*) FROM email_alerts WHERE event_id=?",
+                    ("stale-owner-event",),
+                ).fetchone()[0]
+                case_count = connection.execute(
+                    "SELECT COUNT(*) FROM cases",
+                ).fetchone()[0]
+                connection.close()
+
+        self.assertNotEqual(old_owner["lease_token"], current_owner["lease_token"])
+        self.assertIsNone(stale_result)
+        self.assertEqual(alert_count, 0)
+        self.assertEqual(case_count, 0)
 
     def test_webhook_ledger_recovers_stale_processing_delivery(self):
         import database.database as database

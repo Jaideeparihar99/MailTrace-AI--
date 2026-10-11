@@ -5,11 +5,13 @@ from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from .models import AnchorRequest, AnchorReceipt, AnchorVerification
 from .rules import (
     ANCHOR_STATUS_ANCHORED,
     ANCHOR_STATUS_VERIFIED,
+    MAX_PROOF_BYTES,
     PROVIDER_LOCAL,
     PROVIDER_RFC3161,
     TRUST_LEVEL_EXTERNAL,
@@ -293,12 +295,28 @@ class RFC3161Provider(AnchorProvider):
         [bytes, str, str],
         tuple[bool, str | None, tuple[str, ...]],
     ] | None = None
+    request_builder: Callable[[AnchorRequest], bytes] | None = None
 
     name = PROVIDER_RFC3161
     trust_level = TRUST_LEVEL_TSA
 
+    @property
+    def is_configured(self) -> bool:
+        parsed = urlparse(self.tsa_url)
+        return bool(
+            parsed.scheme == "https"
+            and parsed.netloc
+            and self.request_builder is not None
+            and self.request_transport is not None
+            and self.token_verifier is not None
+        )
+
+    @property
+    def independent_trust_boundary(self) -> bool:
+        return True
+
     def create(self, request: AnchorRequest) -> AnchorReceipt:
-        if self.request_transport is None:
+        if not self.is_configured:
             return AnchorReceipt(
                 anchor_id=request.anchor_id,
                 evidence_id=request.evidence_id,
@@ -312,7 +330,7 @@ class RFC3161Provider(AnchorProvider):
                 proof=None,
                 verification_state="UNVERIFIED",
                 verification_issues=(
-                    "RFC 3161 transport is not configured.",
+                    "RFC 3161 HTTPS URL, request builder, transport, and token verifier must all be configured.",
                 ),
                 nonce=request.nonce,
                 metadata={
@@ -321,11 +339,15 @@ class RFC3161Provider(AnchorProvider):
                 },
             )
 
-        # The transport boundary expects a pre-built RFC 3161
-        # TimeStampReq DER body. Building and validating ASN.1/CMS
-        # is intentionally delegated to the injected implementation.
-        request_bytes = request.commitment_sha256.encode("ascii")
+        # RFC 3161 requires a DER-encoded TimeStampReq, not the digest's
+        # ASCII hex text. ASN.1 request construction is injected explicitly;
+        # this adapter fails closed when a real builder/transport/verifier is absent.
+        request_bytes = self.request_builder(request)
+        if not isinstance(request_bytes, bytes) or not request_bytes or len(request_bytes) > MAX_PROOF_BYTES:
+            raise ValueError("RFC 3161 request builder must return a bounded non-empty DER byte string.")
         token = self.request_transport(request_bytes)
+        if not isinstance(token, bytes) or not token or len(token) > MAX_PROOF_BYTES:
+            raise ValueError("RFC 3161 transport must return a bounded non-empty token byte string.")
 
         return AnchorReceipt(
             anchor_id=request.anchor_id,

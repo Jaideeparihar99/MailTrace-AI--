@@ -559,6 +559,7 @@ integrity_anchoring = IntegrityAnchorEngine(
     providers={
         "local": LocalAnchorProvider(),
     },
+    storage_path=RUNTIME_DATA_DIR / "integrity_anchors.sqlite3",
 )
 
 # Governance applies to derived/control-plane data.
@@ -763,6 +764,8 @@ def _build_evidence_governance(
         "integrity_anchor": {
             "created": False,
             "verified": False,
+            "independent_verification": False,
+            "provider_status": integrity_anchoring.status(),
             "receipt": None,
             "verification": None,
         },
@@ -953,6 +956,11 @@ def _build_evidence_governance(
             result["integrity_anchor"]["verified"] = bool(
                 integrity_verification.valid
             )
+            result["integrity_anchor"]["independent_verification"] = bool(
+                integrity_verification.valid
+                and integrity_verification.trust_level != "LOCAL_TEST_ONLY"
+            )
+            result["integrity_anchor"]["provider_status"] = integrity_anchoring.status()
 
             result["integrity_anchor"]["verification"] = (
                 _model_to_dict(
@@ -1084,6 +1092,7 @@ def readiness_check():
             "recipient_region_routing": (
                 "READY" if recipient_routing_key_configured() else "CENTRAL_FALLBACK_ONLY"
             ),
+            "integrity_anchoring": integrity_anchoring.status(),
         },
         "deployment_constraints": {
             "tenant_scope": "SINGLE_TENANT_ENFORCED" if is_production() else "DEVELOPMENT_MODE"
@@ -2706,6 +2715,18 @@ async def analyze_email(
     return await _analyze_email(file, tenant_id=principal.tenant_id if principal else None)
 
 
+def _sanitize_forensics_smtp_context(context: object) -> dict[str, str] | None:
+    """Keep only trusted, non-recipient SMTP facts for forensic correlation.
+
+    Browser uploads do not have gateway-supplied SMTP context; that is a normal
+    input state, not an analysis error. Reject non-dict values defensively.
+    """
+    if not isinstance(context, dict):
+        return None
+    sanitized = {key: value for key, value in context.items() if key != "recipient"}
+    return sanitized or None
+
+
 async def _analyze_email(
     file: UploadFile,
     trusted_smtp_context: dict[str, str] | None = None,
@@ -2867,7 +2888,7 @@ async def _analyze_email(
             forensic_input,
             verify_authentication=not file.filename.lower().endswith(".msg"),
             smtp_context=(
-                ({key: value for key, value in trusted_smtp_context.items() if key != "recipient"} or None)
+                _sanitize_forensics_smtp_context(trusted_smtp_context)
                 if not file.filename.lower().endswith(".msg")
                 else None
             ),
@@ -3860,7 +3881,8 @@ async def stream_live_threat_intelligence(request: Request):
                 )
                 if current_key != previous_key:
                     snapshot = await asyncio.to_thread(
-                        get_live_threat_intelligence
+                        get_live_threat_intelligence,
+                        request,
                     )
                     events = snapshot.get("events", [])
                     latest = events[0] if events else {}
