@@ -426,6 +426,7 @@ class RFC3161Provider(AnchorProvider):
 
         provider_verified = False
         timestamp_present = False
+        verified_timestamp: str | None = None
 
         if self.token_verifier is None:
             issues.append(
@@ -468,6 +469,8 @@ class RFC3161Provider(AnchorProvider):
                             "RFC 3161 token timestamp is outside "
                             "the configured local clock-skew window."
                         )
+                    else:
+                        verified_timestamp = receipt_time.astimezone(timezone.utc).isoformat()
                 else:
                     issues.append(
                         "RFC 3161 token did not provide a timestamp."
@@ -515,4 +518,5 @@ class RFC3161Provider(AnchorProvider):
                 else TRUST_LEVEL_EXTERNAL
             ),
             issues=tuple(issues),
+            anchored_at_utc=verified_timestamp if valid else None,
         )

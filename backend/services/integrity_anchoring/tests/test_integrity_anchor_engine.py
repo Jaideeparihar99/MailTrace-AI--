@@ -140,6 +140,9 @@ def test_rfc3161_transport_receives_builder_der_not_ascii_digest():
         verification = engine.verify_anchor(receipt.anchor_id)
         assert verification.valid
         assert verification.trust_level == "TSA_VERIFIED"
+        persisted_receipt = engine.get_anchor(receipt.anchor_id)
+        assert persisted_receipt.anchored_at_utc is not None
+        assert persisted_receipt.verification_state == "VERIFIED"
 
 
 if __name__ == "__main__":

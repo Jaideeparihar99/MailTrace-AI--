@@ -343,6 +343,7 @@ class IntegrityAnchorEngine:
                     **{
                         **asdict(receipt),
                         "status": "VERIFIED" if result.valid else receipt.status,
+                        "anchored_at_utc": result.anchored_at_utc or receipt.anchored_at_utc,
                         "trust_level": result.trust_level,
                         "verification_state": "VERIFIED" if result.valid else "FAILED",
                         "verification_issues": result.issues,
