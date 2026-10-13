@@ -4,6 +4,7 @@ import re
 from collections import Counter
 from email.utils import parseaddr
 from typing import Any
+from services.domain_alignment import organizational_domain
 
 
 SENSITIVE_HEADERS = {
@@ -237,7 +238,9 @@ def detect_header_anomalies(
     if (
         from_domain
         and reply_to_domain
-        and from_domain != reply_to_domain
+        and organizational_domain(from_domain)
+        and organizational_domain(reply_to_domain)
+        and organizational_domain(from_domain) != organizational_domain(reply_to_domain)
     ):
 
         _add_finding(
@@ -271,7 +274,9 @@ def detect_header_anomalies(
     if (
         from_domain
         and return_path_domain
-        and from_domain != return_path_domain
+        and organizational_domain(from_domain)
+        and organizational_domain(return_path_domain)
+        and organizational_domain(from_domain) != organizational_domain(return_path_domain)
     ):
 
         _add_finding(

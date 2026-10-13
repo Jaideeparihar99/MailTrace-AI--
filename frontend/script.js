@@ -1,3 +1,8 @@
+        window.mailtraceApiUrl = function mailtraceApiUrl(path) {
+            const base = String(window.MAILTRACE_API_BASE || "http://127.0.0.1:8002").replace(/\/+$/, "");
+            return `${base}/${String(path || "").replace(/^\/+/, "")}`;
+        };
+
         console.log("🔥 MAILTRACE JS LOADED");
 
         // Shared page-header helper used by both DOM-ready navigation handlers
@@ -39,7 +44,7 @@
         };
         const loadPersistedSecurityAlerts = async () => {
             try {
-                const response = await fetch("http://127.0.0.1:8000/api/alerts?limit=100", { cache: "no-store" });
+                const response = await fetch(window.mailtraceApiUrl("/api/alerts?limit=100"), { cache: "no-store" });
                 if (!response.ok) return;
                 const payload = await response.json();
                 if (!Array.isArray(payload.alerts)) return;
@@ -237,7 +242,7 @@
                 panel.remove();
                 trigger?.setAttribute("aria-expanded", "false");
                 if (alertId) {
-                    void fetch(`http://127.0.0.1:8000/api/alerts/${encodeURIComponent(alertId)}/acknowledge`, { method: "POST" }).then(() => loadPersistedSecurityAlerts()).catch(() => {});
+                    void fetch(window.mailtraceApiUrl(`/api/alerts/${encodeURIComponent(alertId)}/acknowledge`), { method: "POST" }).then(() => loadPersistedSecurityAlerts()).catch(() => {});
                 }
                 if (caseId) await openCase(caseId);
                 else if (id) await openInvestigation(id);
@@ -641,7 +646,7 @@
 
                 // Send file to FastAPI
                 const response = await fetch(
-                    "http://127.0.0.1:8000/api/analyze-email",
+                    window.mailtraceApiUrl("/api/analyze-email"),
                     {
                         method: "POST",
                         body: formData
@@ -1334,10 +1339,22 @@ const iocScoreStatus = iocEvidence.length || iocMatchedCount
     ? "Evidence evaluated"
     : "No IOC matches returned";
 
-            const scoreBreakdown =
-                Array.isArray(threat.score_breakdown)
-                    ? threat.score_breakdown
-                    : [];
+            // This renderer is called before the later fusion UI block is
+            // initialized, so read its data from the current analysis payload.
+            const fusionResult = analysis.intelligence_fusion && typeof analysis.intelligence_fusion === "object"
+                ? analysis.intelligence_fusion
+                : {};
+            const fusionBreakdown = Array.isArray(fusionResult.score_breakdown)
+                ? fusionResult.score_breakdown
+                : [];
+            const scoreBreakdown = fusionBreakdown.length
+                ? fusionBreakdown.map(item => ({
+                    category: "Fusion scoring",
+                    signal: item.component,
+                    points: item.points,
+                    source: item.source
+                }))
+                : (Array.isArray(threat.score_breakdown) ? threat.score_breakdown : []);
 
             const receivedChain =
                 analysis.received_chain || [];
@@ -1371,7 +1388,7 @@ const iocScoreStatus = iocEvidence.length || iocMatchedCount
                 ? `${resultConfidence} CONFIDENCE`
                 : "CONFIDENCE NOT PROVIDED";
             const resultTopSignals = [
-                ...indicators.map(item => typeof item === "string" ? item : item?.title || item?.name || item?.signal || item?.type),
+                ...indicators.filter(item => typeof item === "string" || !["INFO", "LOW"].includes(String(item?.severity || "").toUpperCase())).map(item => typeof item === "string" ? item : item?.title || item?.name || item?.signal || item?.type),
                 ...scoreBreakdown.map(item => item?.signal || item?.category)
             ].filter(Boolean).filter((item, index, list) => list.indexOf(item) === index).slice(0, 3);
             const resultRiskGuidance = resultRiskBand === "unknown"
@@ -1391,7 +1408,9 @@ const iocScoreStatus = iocEvidence.length || iocMatchedCount
                 ]
                 : resultRiskBand === "high"
                 ? [
-                    "Keep the message and attachments isolated from end users.",
+                    ...(Array.isArray(analysis.attachments) && analysis.attachments.length
+                        ? ["Keep the message and attachments isolated from end users."]
+                        : ["Keep the message isolated from end users while the evidence is reviewed."]),
                     "Verify the sender using a trusted contact method outside this email thread.",
                     "Preserve the original message and escalate with the evidence below."
                 ]
@@ -2693,11 +2712,8 @@ const existingResult =
                                     </div>
 
                                     <span class="score-breakdown-points">
-                                        +${escapeHTML(
-                                            String(
-                                                item.points ?? 0
-                                            )
-                                        )}
+                                        ${Number(item.points ?? 0) > 0 ? "+" : ""}${escapeHTML(String(item.points ?? 0))}
+                                        ${item.source ? `<small>${escapeHTML(item.source)}</small>` : ""}
                                     </span>
 
                                 </div>
@@ -5255,7 +5271,7 @@ const existingResult =
 
                 const response =
                     await fetch(
-                        "http://127.0.0.1:8000/api/investigations"
+                        window.mailtraceApiUrl("/api/investigations")
                     );
 
 
@@ -6157,9 +6173,9 @@ const existingResult =
 
                 const response =
                     await fetch(
-                        `http://127.0.0.1:8000/api/investigations/${encodeURIComponent(
+                        window.mailtraceApiUrl(`/api/investigations/${encodeURIComponent(
                             investigationId
-                        )}`
+                        )}`)
                     );
 
                 const data =
@@ -6551,7 +6567,7 @@ const existingResult =
             const controller = new AbortController();
             const timeout = window.setTimeout(() => controller.abort(), 5000);
             try {
-                const response = await fetch("http://127.0.0.1:8000/api/ready", {
+                const response = await fetch(window.mailtraceApiUrl("/api/ready"), {
                     cache: "no-store",
                     signal: controller.signal
                 });
@@ -6592,9 +6608,9 @@ const existingResult =
 
         async function loadDashboardStats() {
             const endpoints = [
-                "http://127.0.0.1:8000/api/investigations",
-                "http://127.0.0.1:8000/api/cases",
-                "http://127.0.0.1:8000/api/campaigns"
+                window.mailtraceApiUrl("/api/investigations"),
+                window.mailtraceApiUrl("/api/cases"),
+                window.mailtraceApiUrl("/api/campaigns")
             ];
 
             const results = await Promise.allSettled(
@@ -6764,7 +6780,7 @@ const existingResult =
             try {
 
                 const response = await fetch(
-                    "http://127.0.0.1:8000/api/investigations"
+                    window.mailtraceApiUrl("/api/investigations")
                 );
 
                 const data = await response.json();
@@ -7047,6 +7063,16 @@ const existingResult =
                     "Recent Investigations Error:",
                     error
                 );
+                const tbody = document.querySelector(".investigations-panel tbody");
+                if (tbody) {
+                    tbody.innerHTML = `
+                        <tr>
+                            <td colspan="6" class="muted">
+                                Investigation data is unavailable. Check the backend connection and refresh.
+                            </td>
+                        </tr>
+                    `;
+                }
 
             }
 
@@ -7083,7 +7109,7 @@ const existingResult =
             try {
 
                 const response = await fetch(
-                    "http://127.0.0.1:8000/api/investigations",
+                    window.mailtraceApiUrl("/api/investigations"),
                     { signal: chartController.signal }
                 );
 
@@ -7952,7 +7978,7 @@ const existingResult =
             document.getElementById("refreshReports")?.addEventListener("click", loadReports);
 
             try {
-                const response = await fetch("http://127.0.0.1:8000/api/investigations");
+                const response = await fetch(window.mailtraceApiUrl("/api/investigations"));
                 const data = await response.json();
                 if (!response.ok) throw new Error(data.detail || "Failed to load reports.");
 
@@ -8119,7 +8145,7 @@ const existingResult =
             modal.addEventListener("click", event => { if (event.target === modal) close(); });
 
             try {
-                const response = await fetch(`http://127.0.0.1:8000/api/reports/map-view/${encodeURIComponent(investigationId)}`);
+                const response = await fetch(window.mailtraceApiUrl(`/api/reports/map-view/${encodeURIComponent(investigationId)}`));
                 const data = await response.json();
                 if (!response.ok) throw new Error(data.detail || "Unable to load map data.");
 
@@ -8760,7 +8786,7 @@ async function loadCases() {
 
                 const response =
                     await fetch(
-                        "http://127.0.0.1:8000/api/soc/routing/queue"
+                        window.mailtraceApiUrl("/api/soc/routing/queue")
                     );
 
 
@@ -8976,7 +9002,7 @@ async function loadCases() {
 
                 const response =
                     await fetch(
-                        "http://127.0.0.1:8000/api/campaigns"
+                        window.mailtraceApiUrl("/api/campaigns")
                     );
 
 
@@ -9360,9 +9386,9 @@ async function loadCases() {
 
                 const response =
                     await fetch(
-                        `http://127.0.0.1:8000/api/campaigns/${encodeURIComponent(
+                        window.mailtraceApiUrl(`/api/campaigns/${encodeURIComponent(
                             campaignId
-                        )}`
+                        )}`)
                     );
 
 
@@ -10430,7 +10456,7 @@ async function loadCases() {
                 if (!caseId) return;
                 button.disabled = true;
                 try {
-                    const rosterResponse = await fetch("http://127.0.0.1:8000/api/soc/routing/analysts");
+                    const rosterResponse = await fetch(window.mailtraceApiUrl("/api/soc/routing/analysts"));
                     const rosterPayload = await rosterResponse.json().catch(() => ({}));
                     if (!rosterResponse.ok) throw new Error(rosterPayload.detail || "Unable to load the authorized analyst roster.");
                     const activeAnalysts = (rosterPayload.analysts || []).filter(item => item.active);
@@ -10440,7 +10466,7 @@ async function loadCases() {
                     if (!analystSubject) return;
                     const reason = (window.prompt("Required audit reason for manual reassignment:", "SLA/workload balancing") || "").trim();
                     if (reason.length < 5) throw new Error("A reassignment reason of at least 5 characters is required.");
-                    const response = await fetch(`http://127.0.0.1:8000/api/soc/routing/cases/${encodeURIComponent(caseId)}/assign`, {
+                    const response = await fetch(window.mailtraceApiUrl(`/api/soc/routing/cases/${encodeURIComponent(caseId)}/assign`), {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ analyst_subject: analystSubject, reason })
@@ -10595,7 +10621,7 @@ async function loadCases() {
             try {
 
                 const response = await fetch(
-                    `http://127.0.0.1:8000/api/cases/${encodeURIComponent(caseId)}`
+                    window.mailtraceApiUrl(`/api/cases/${encodeURIComponent(caseId)}`)
                 );
 
                 const data = await response.json();
@@ -10620,7 +10646,7 @@ async function loadCases() {
                 let routing = null;
                 try {
                     const routingResponse = await fetch(
-                        `http://127.0.0.1:8000/api/soc/routing/cases/${encodeURIComponent(caseId)}`
+                        window.mailtraceApiUrl(`/api/soc/routing/cases/${encodeURIComponent(caseId)}`)
                     );
                     if (routingResponse.ok) {
                         const routingPayload = await routingResponse.json();
@@ -11061,7 +11087,7 @@ async function loadCases() {
                 if (action === "release" && !reason) { button.disabled = false; return; }
                 try {
                     const response = await fetch(
-                        `http://127.0.0.1:8000/api/cases/${encodeURIComponent(caseData.case_id)}/${action}`,
+                        window.mailtraceApiUrl(`/api/cases/${encodeURIComponent(caseData.case_id)}/${action}`),
                         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }
                     );
                     const payload = await response.json().catch(() => ({}));
@@ -11085,7 +11111,7 @@ async function loadCases() {
                 button.disabled = true;
                 try {
                     const response = await fetch(
-                        `http://127.0.0.1:8000/api/cases/${encodeURIComponent(caseData.case_id)}/renew`,
+                        window.mailtraceApiUrl(`/api/cases/${encodeURIComponent(caseData.case_id)}/renew`),
                         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason: "owner renewal from case detail" }) }
                     );
                     const payload = await response.json().catch(() => ({}));
@@ -11108,7 +11134,7 @@ async function loadCases() {
                 panel.hidden = false;
                 panel.querySelector(".result-card-title + .case-empty-state")?.replaceChildren(document.createTextNode("Loading audit history…"));
                 try {
-                    const base = `http://127.0.0.1:8000`;
+                    const base = String(window.MAILTRACE_API_BASE || "http://127.0.0.1:8002").replace(/\/+$/, "");
                     const [claimResponse, routingResponse, caseAuditResponse] = await Promise.all([
                         fetch(`${base}/api/cases/${encodeURIComponent(caseData.case_id)}/history`),
                         fetch(`${base}/api/soc/routing/cases/${encodeURIComponent(caseData.case_id)}/history`),
@@ -11482,7 +11508,7 @@ async function loadCases() {
 
                     const response =
                         await fetch(
-                            "http://127.0.0.1:8000/api/ip-intelligence",
+                            window.mailtraceApiUrl("/api/ip-intelligence"),
                             {
                                 method: "POST",
 

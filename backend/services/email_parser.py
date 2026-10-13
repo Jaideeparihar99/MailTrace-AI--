@@ -11,6 +11,7 @@ from services.attachment_intelligence.file_type_analysis import (
     MAX_HEADER_READ,
     analyze_file_type,
 )
+from services.domain_alignment import organizational_domain
 
 
 MAX_STATIC_ATTACHMENT_ANALYSES = 50
@@ -913,7 +914,9 @@ def analyze_threat(
         if (
             sender_domain
             and reply_domain
-            and sender_domain != reply_domain
+            and organizational_domain(sender_domain)
+            and organizational_domain(reply_domain)
+            and organizational_domain(sender_domain) != organizational_domain(reply_domain)
         ):
 
             score += 20
@@ -961,7 +964,10 @@ def analyze_threat(
         if (
             sender_domain
             and return_domain
-            and sender_domain != return_domain
+            and validated_dmarc != "PASS"
+            and organizational_domain(sender_domain)
+            and organizational_domain(return_domain)
+            and organizational_domain(sender_domain) != organizational_domain(return_domain)
         ):
 
             score += 10

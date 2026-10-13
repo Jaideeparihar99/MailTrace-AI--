@@ -2,6 +2,7 @@
 
 import re
 from typing import Any
+from services.domain_alignment import organizational_domain
 
 
 def validate_email_authentication(
@@ -244,12 +245,10 @@ def analyze_authentication(
         )
 
         if sender_domain and return_domain:
-            alignment = (
-                "ALIGNED"
-                if sender_domain.group(1).lower()
-                == return_domain.group(1).lower()
-                else "MISMATCH"
-            )
+            sender_org = organizational_domain(sender_domain.group(1))
+            return_org = organizational_domain(return_domain.group(1))
+            alignment = ("ALIGNED" if sender_org and return_org and sender_org == return_org else
+                         "UNKNOWN" if not sender_org or not return_org else "MISMATCH")
 
     # -----------------------------------------------------
     # RISK ASSESSMENT
@@ -323,7 +322,7 @@ def analyze_authentication(
             )
         })
 
-    if alignment == "MISMATCH":
+    if alignment == "MISMATCH" and dmarc != "PASS":
         findings.append({
             "type": "alignment",
             "severity": "HIGH",

@@ -156,6 +156,8 @@ def _probability_from_ai(ai_result: Mapping[str, Any]) -> float:
 
 
 def _ai_signal(ai_result: Mapping[str, Any]) -> Signal | None:
+    if _upper(ai_result.get("status")) in {"MODEL_NOT_READY", "UNAVAILABLE", "ERROR", "SKIPPED"}:
+        return None
     probability = _probability_from_ai(ai_result)
     classification = _upper(ai_result.get("classification"))
     if probability <= 0.0 and not classification:
@@ -187,8 +189,12 @@ def _content_signals(email: Mapping[str, Any]) -> List[Signal]:
         if _has_any(combined, terms):
             signals.append(_make_signal(cat, name, score, conf, evidence, critical, "email_content", .80))
     urgency = ("urgent","immediately","right away","suspended","deadline","act now","within 24")
-    social = ("suspended","verify","urgent","confidential","immediately","act now","avoid closure")
-    if _has_any(combined, urgency) and _has_any(combined, social):
+    social = ("verify your account","verify your identity","enter your password","sign in","avoid closure","account will be closed","click here to verify")
+    headers = email.get("headers") if isinstance(email.get("headers"), Mapping) else {}
+    promotional_context = bool(email.get("promotional") or email.get("unsubscribe_url")
+        or _has_any(" ".join(f"{k} {v}" for k, v in headers.items()).lower(), ("list-unsubscribe", "bulk", "marketing"))
+        or _has_any(combined, ("discount", "sale", "offer", "shop now", "unsubscribe", "terms and conditions")))
+    if _has_any(combined, urgency) and _has_any(combined, social) and not promotional_context:
         signals.append(_make_signal("social_engineering","urgency_pressure_pattern",82,.84,
                                     "Urgency and pressure-to-act pattern detected.",True,"email_content",.82))
     return signals
@@ -231,16 +237,18 @@ def _header_signals(email: Mapping[str, Any]) -> List[Signal]:
 
 
 def _url_signals(email: Mapping[str, Any]) -> List[Signal]:
-    urls = _as_list(email.get("urls"))
-    if not urls:
+    url_intel = email.get("advanced_url_intelligence") or email.get("url_intelligence")
+    if not isinstance(url_intel, Mapping):
         return []
-    markers = ("login","verify","secure","account","signin","password","update","confirm")
-    suspicious = sum(_has_any(_lower(url), markers) for url in urls)
-    score = min(94,68+suspicious*8) if suspicious else 58
-    conf = min(.93,.72+suspicious*.05) if suspicious else .65
+    risk = _safe_float(url_intel.get("risk_score", url_intel.get("score", 0)))
+    verdict = _upper(url_intel.get("verdict"))
+    if risk < 50 and verdict not in {"SUSPICIOUS", "DECEPTIVE_OR_SUSPICIOUS", "HIGH_CONFIDENCE_DECEPTIVE", "HIGH_RISK"}:
+        return []
+    score = _clamp(max(68, risk))
+    conf = min(.93,.72+score/500)
     return [_make_signal("url","url_delivery_signal",score,conf,
-                         f"{len(urls)} URL(s) present; {suspicious} contain suspicious delivery markers.",
-                         suspicious >= 1,"url_intelligence",.72)]
+                         f"URL intelligence verdict={verdict or 'UNKNOWN'}; risk score={risk:.2f}.",
+                         True,"url_intelligence",.88)]
 
 
 def _attachment_signals(email: Mapping[str, Any]) -> List[Signal]:
@@ -316,12 +324,19 @@ def _attachment_signals(email: Mapping[str, Any]) -> List[Signal]:
 def _forensic_signals(forensic: Mapping[str, Any] | None) -> List[Signal]:
     if not isinstance(forensic, Mapping):
         return []
-    score = _safe_float(forensic.get("risk_score", forensic.get("score", 0)))
-    if score <= 0:
+    findings = forensic.get("findings")
+    if not isinstance(findings, list):
         return []
-    score = _clamp(score)
-    return [_make_signal("forensics","email_forensic_risk",score,min(.96,.60+score/250),
-                         f"Forensic analysis risk_score={score:.2f}.",score>=80,"email_forensics",.82)]
+    severe = [item for item in findings if isinstance(item, Mapping)
+              and _upper(item.get("severity")) in {"HIGH", "CRITICAL"}
+              and "return-path" not in _lower(item.get("title"))
+              and "return-path" not in _lower(item.get("category"))]
+    if not severe:
+        return []
+    score = min(90.0, 68.0 + 8.0 * len(severe))
+    return [_make_signal("forensics", "email_forensic_findings", score, .70,
+                         f"{len(severe)} independent high/critical forensic finding(s).", len(severe) >= 2,
+                         "email_forensics_findings", .75)]
 
 
 def _ti_signals(threat_intelligence: Mapping[str, Any] | None) -> List[Signal]:
@@ -429,7 +444,14 @@ def _calculate_data_quality(email, ai_result, forensic, ti, ip) -> Dict[str,Any]
 def _fuse(signals: Sequence[Signal]) -> Tuple[float,float,Dict[str,Any]]:
     if not signals:
         meta={"category_scores":{},"convergence":_calculate_convergence({}),"base_score":0.0,
-              "evidence_confidence":0.0,"correlation_groups":[]}
+              "corroboration_strength":0.0,"severe_strength":0.0,"severity_bonus":0.0,
+              "corroboration_bonus":0.0,"evidence_confidence":0.0,"correlation_groups":{},
+              "score_breakdown":[{"component":"weighted_evidence","points":0.0,"source":"no evidence"},
+                                 {"component":"corroboration","points":0.0,"source":"no corroborating evidence"},
+                                 {"component":"convergence_bonus","points":0.0,"source":"no independent evidence"},
+                                 {"component":"severity_bonus","points":0.0,"source":"no severe signals"},
+                                 {"component":"corroboration_bonus","points":0.0,"source":"no corroborated categories"},
+                                 {"component":"evidence_breadth_bonus","points":0.0,"source":"no evidence breadth"}]}
         return 0.0,0.0,meta
     cats = _aggregate_categories(signals)
     grouped_scores: Dict[str,List[float]] = {}
@@ -454,8 +476,10 @@ def _fuse(signals: Sequence[Signal]) -> Tuple[float,float,Dict[str,Any]]:
     severe_strength=sum(severe[:4])/max(1,len(severe[:4])) if severe else 0
     severity_bonus=5 if conv["severe_count"]>=4 else 2.5 if conv["severe_count"]>=2 else 0
     corroboration_bonus=2 if conv["corroborated_count"]>=4 else 1 if conv["corroborated_count"]>=2 else 0
-    final=.62*base+.38*corroboration_strength+conv["convergence_bonus"]+severity_bonus+corroboration_bonus
-    if conv["independent_count"]>=5: final+=2.5
+    base_component=.62*base
+    corroboration_component=.38*corroboration_strength
+    breadth_bonus=2.5 if conv["independent_count"]>=5 else 0.0
+    final=base_component+corroboration_component+conv["convergence_bonus"]+severity_bonus+corroboration_bonus+breadth_bonus
     final=_clamp(final)
     confs=[_clamp01(_safe_float(v.get("confidence"))) for v in cats.values()]
     strong_confs=[_clamp01(_safe_float(v.get("confidence"))) for v in cats.values() if _safe_float(v.get("score"))>=65]
@@ -468,7 +492,14 @@ def _fuse(signals: Sequence[Signal]) -> Tuple[float,float,Dict[str,Any]]:
     meta={"category_scores":cats,"convergence":conv,"base_score":round(base,6),
           "corroboration_strength":round(corroboration_strength,6),"severe_strength":round(severe_strength,6),
           "severity_bonus":round(severity_bonus,6),"corroboration_bonus":round(corroboration_bonus,6),
-          "evidence_confidence":round(evidence_conf,6),"correlation_groups":correlation_group_scores}
+          "evidence_confidence":round(evidence_conf,6),"correlation_groups":correlation_group_scores,
+          "score_breakdown":[
+              {"component":"weighted_evidence", "points":round(base_component,6), "source":"62% of weighted category score"},
+              {"component":"corroboration", "points":round(corroboration_component,6), "source":"38% of strongest independent signals"},
+              {"component":"convergence_bonus", "points":round(conv["convergence_bonus"],6), "source":"independent evidence convergence"},
+              {"component":"severity_bonus", "points":round(severity_bonus,6), "source":"multiple severe categories"},
+              {"component":"corroboration_bonus", "points":round(corroboration_bonus,6), "source":"corroborated categories"},
+              {"component":"evidence_breadth_bonus", "points":round(breadth_bonus,6), "source":"five or more independent categories"}]}
     return round(final,6),round(evidence_conf,6),meta
 
 
@@ -556,8 +587,27 @@ def analyze_email_intelligence(email=None,ai_result=None,forensic=None,threat_in
     independent=fusion_meta["convergence"]["independent_count"]
     if independent==0 and unified>75: unified=75
     elif independent==1 and unified>85: unified=85
+    validation=email.get("authentication_validation") or {}
+    auth_all_pass=all(_upper((validation.get(k) or {}).get("status")) == "PASS"
+                      for k in ("spf", "dkim", "dmarc") if isinstance(validation.get(k), Mapping))
+    has_auth_results=any(isinstance(validation.get(k), Mapping) for k in ("spf", "dkim", "dmarc"))
+    protected={"credential_theft", "fraud", "malware_delivery", "identity", "threat_intelligence", "url"}
+    if auth_all_pass and has_auth_results and not any(s.category in protected for s in signals):
+        uncapped=unified
+        unified=min(unified, 15.0)
+        if unified < uncapped:
+            fusion_meta.setdefault("score_breakdown", []).append({
+                "component":"evidence_limited_cap", "points":round(unified-uncapped, 6),
+                "source":"authentication passed and no specific threat evidence was present"})
+    breakdown=fusion_meta.get("score_breakdown", [])
+    if breakdown:
+        # Round-off is absorbed into the final line so displayed points sum to
+        # the exact score emitted by fusion.
+        delta=round(unified-sum(_safe_float(item.get("points")) for item in breakdown), 6)
+        if delta:
+            breakdown[-1]["points"]=round(_safe_float(breakdown[-1].get("points"))+delta, 6)
     evidence=[_evidence_record(s) for s in signals]
-    critical=[_evidence_record(s) for s in signals if s.critical or s.score>=80]
+    critical=[_evidence_record(s) for s in signals if (s.critical or s.score>=80) and independent>=2]
     risk_drivers=sorted([{"category":c,"score":round(_safe_float(v.get("score")),6),"confidence":round(_safe_float(v.get("confidence")),6)}
                          for c,v in fusion_meta["category_scores"].items()],key=lambda x:x["score"],reverse=True)
     decision=_decision(classification,unified,overall,evidence_conf,len(signals))
@@ -581,6 +631,7 @@ def analyze_email_intelligence(email=None,ai_result=None,forensic=None,threat_in
         "explainability":{"reason":"Risk is derived from grouped evidence with convergence, correlation controls and corroboration; the score is not an ML probability.",
             "top_risk_drivers":risk_drivers[:6],"independent_evidence_components":fusion_meta["convergence"]["independent_categories"],
             "convergence":"MULTI_SIGNAL_CORROBORATION" if independent>=2 else "LIMITED_CORROBORATION"},
+        "score_breakdown":fusion_meta.get("score_breakdown",[]),
         "fusion_metrics":{"base_weighted_score":fusion_meta["base_score"],"corroboration_strength":fusion_meta["corroboration_strength"],
             "severe_strength":fusion_meta["severe_strength"],"convergence_bonus":fusion_meta["convergence"]["convergence_bonus"],
             "severity_bonus":fusion_meta["severity_bonus"],"corroboration_bonus":fusion_meta["corroboration_bonus"],
