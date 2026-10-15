@@ -1,9 +1,19 @@
+from email.message import Message
+
 from services.domain_alignment import domains_differ, organizational_domain
 from services.email_ai.intelligence_fusion import analyze_email_intelligence
+from services.email_parser import analyze_threat
 
 
 def _passed_auth():
     return {key: {"status": "PASS"} for key in ("spf", "dkim", "dmarc")}
+
+
+def _parser_threat_result(subject, body):
+    message = Message()
+    message["From"] = "updates@example.test"
+    message["Subject"] = subject
+    return analyze_threat(message, body, [], {"validation": {}}, [])
 
 
 def test_organizational_domains_follow_public_suffix_boundaries():
@@ -64,3 +74,54 @@ def test_single_generic_signal_is_not_reported_as_corroborated_critical():
         ai_result={"status": "MODEL_NOT_READY"},
     )
     assert result["critical_signal_count"] == 0
+
+
+def test_disclaimer_urgency_words_do_not_add_parser_social_engineering_points():
+    result = _parser_threat_result(
+        "Offer details",
+        "Offers may be revoked or suspended under the terms and conditions.",
+    )
+
+    assert result["score"] == 0
+    assert not any(i["type"] == "social_engineering" for i in result["indicators"])
+
+
+def test_quoted_or_negated_urgency_does_not_add_parser_social_engineering_points():
+    for body in (
+        'The message said, "Your account is suspended immediately," as an example.',
+        "We will never ask you to verify your account immediately by email.",
+    ):
+        result = _parser_threat_result("Account security guidance", body)
+        assert result["score"] == 0
+        assert not any(i["type"] == "social_engineering" for i in result["indicators"])
+
+
+def test_fusion_ignores_quoted_or_negated_credential_pressure_phrases():
+    for body in (
+        'The sample said, "Your account will be suspended immediately. Verify your account."',
+        "We will never ask you to verify your account immediately or enter your password.",
+    ):
+        result = analyze_email_intelligence(
+            email={"subject": "Security guidance", "body": body},
+            ai_result={"status": "MODEL_NOT_READY"},
+        )
+        assert not {item["name"] for item in result["evidence"]} & {
+            "credential_harvesting_language",
+            "urgency_pressure_pattern",
+        }
+
+
+def test_actionable_suspension_phishing_keeps_parser_and_fusion_evidence():
+    subject = "Urgent: verify your account"
+    body = "Your account will be suspended immediately. Verify your account and enter your password."
+    parsed = _parser_threat_result(subject, body)
+    fused = analyze_email_intelligence(
+        email={"subject": subject, "body": body},
+        ai_result={"status": "MODEL_NOT_READY"},
+    )
+
+    assert any(i["type"] == "social_engineering" for i in parsed["indicators"])
+    assert {item["name"] for item in fused["evidence"]} >= {
+        "credential_harvesting_language",
+        "urgency_pressure_pattern",
+    }

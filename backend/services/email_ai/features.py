@@ -6,6 +6,7 @@ from collections import Counter
 from html import unescape
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse
+from services.domain_alignment import domains_differ, normalized_host, organizational_domain
 
 
 MAX_FIELD_CHARS = 30000
@@ -82,33 +83,7 @@ def _safe_list(value: Any) -> List[Any]:
 
 
 def _domain_from_email(value: str) -> str:
-
-    if not value:
-        return ""
-
-    value = str(value).strip()
-
-    # Extract domain from a normal email address or
-    # display-name format such as:
-    # Microsoft Security <security@example.com>
-    email_matches = re.findall(
-        r"[A-Za-z0-9._%+\-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})",
-        value,
-    )
-
-    if email_matches:
-        return email_matches[-1].lower()
-
-    # Fallback extraction.
-    match = re.search(
-        r"@([A-Za-z0-9.-]+\.[A-Za-z]{2,})",
-        value,
-    )
-
-    if match:
-        return match.group(1).lower()
-
-    return ""
+    return normalized_host(value) or ""
 # =========================================================
 # EMAIL TEXT FOR EXISTING ML MODEL
 # =========================================================
@@ -539,7 +514,7 @@ def extract_advanced_features(
     sender_reply_mismatch = bool(
         sender_domain
         and reply_domain
-        and sender_domain != reply_domain
+        and domains_differ(sender_domain, reply_domain)
     )
 
 
@@ -1480,16 +1455,7 @@ def _normalize_identity_text(
 def _domain_root(
     domain: str
 ) -> str:
-
-    if not domain:
-        return ""
-
-    parts = domain.lower().split(".")
-
-    if len(parts) < 2:
-        return domain.lower()
-
-    return parts[-2]
+    return organizational_domain(domain) or normalized_host(domain) or ""
 
 
 def _levenshtein_distance(
@@ -1883,7 +1849,7 @@ def analyze_identity_intelligence(
 
     if sender_domain and reply_domain:
 
-        if sender_domain != reply_domain:
+        if domains_differ(sender_domain, reply_domain):
             risk_score += 20
 
     if typosquatting:

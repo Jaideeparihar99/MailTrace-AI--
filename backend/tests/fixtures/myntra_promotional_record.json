@@ -1,0 +1,38 @@
+{
+  "source": "Read-only export of parsed content from backend/mailtrace.db, investigation INV-98D48FB0B1 (2026-10-11). Original raw MIME was not available.",
+  "historical_observation": {
+    "risk_score": 82,
+    "verdict": "HIGH RISK",
+    "fusion_signal": "social_engineering.urgency_pressure_pattern"
+  },
+  "email": {
+    "sender": "Myntra <updates@myntra.com>",
+    "subject": "It's LIVE! It's BIG! It's BFF! 😍",
+    "body": "Myntra \r\n \r\n        \r\n     \r\n3X Discounts Are Yours To Unlock! 🤑       \r\n   \r\n  \r\n         \r\n     \r\n       \r\n     \r\n       \r\n     \r\n           \r\n         \r\n     \r\n       \r\n     \r\n              \r\n    \r\n   \r\n    \r\n     \r\n     \r\n     \r\n     \r\n          *T&C Apply. Offers on Myntra marketplace are brought to you by participating seller/s at their discretion and may be revoked or suspended by them at any time. If you would prefer not receiving our emails, please \r\nclick here   to unsubscribe.             \r\n If you would like to experience the best of online shopping for men, women and kids in India, you are at theright place. Myntra is the ultimate destination for fashion and lifestyle, being host to a wide array of merchandise including clothing,footwear,accessories, jewellery, personal care products and more. It is time to redefine your style statement with our treasure-trove of trendy items. Our online store brings you the latest in designer products straight out of fashion houses. You can shop online at Myntra from the comfort of your home and get your favourites delivered right to your\r\ndoorsteps.",
+    "headers": {
+      "list-unsubscribe": "present"
+    },
+    "authentication_validation": {
+      "spf": {
+        "status": "UNVERIFIED_NO_TRUSTED_SMTP_IP"
+      },
+      "dkim": {
+        "status": "TEMPORARY_ERROR_OR_INVALID_KEY"
+      },
+      "dmarc": {
+        "status": "DNS_LOOKUP_ERROR"
+      },
+      "reported_headers_trusted": false
+    }
+  },
+  "ai_result": {
+    "status": "MODEL_NOT_READY"
+  },
+  "threat_intelligence": {
+    "status": "no_iocs",
+    "coverage_status": "NEVER_SYNCED",
+    "iocs": [],
+    "matched_count": 0,
+    "matches": {}
+  }
+}

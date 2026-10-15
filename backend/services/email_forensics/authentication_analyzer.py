@@ -2,7 +2,7 @@
 
 import re
 from typing import Any
-from services.domain_alignment import organizational_domain
+from services.domain_alignment import compare_domains, normalized_host
 
 
 def validate_email_authentication(
@@ -127,6 +127,9 @@ def validate_email_authentication(
         validation["validation_engine"] = "UNAVAILABLE"
         validation["error"] = type(error).__name__
 
+    validation["independent_validation"] = True
+    validation["validation_source"] = "mailtrace_independent_validator"
+    validation["validated_domain"] = normalized_host(sender)
     return validation
 
 
@@ -231,24 +234,12 @@ def analyze_authentication(
     sender = headers.get("from")
     return_path = headers.get("return_path")
 
-    alignment = "UNKNOWN"
-
-    if sender and return_path:
-        sender_domain = re.search(
-            r"@([A-Za-z0-9.-]+)",
-            sender
-        )
-
-        return_domain = re.search(
-            r"@([A-Za-z0-9.-]+)",
-            return_path
-        )
-
-        if sender_domain and return_domain:
-            sender_org = organizational_domain(sender_domain.group(1))
-            return_org = organizational_domain(return_domain.group(1))
-            alignment = ("ALIGNED" if sender_org and return_org and sender_org == return_org else
-                         "UNKNOWN" if not sender_org or not return_org else "MISMATCH")
+    domain_comparison = compare_domains(sender or "", return_path or "")
+    alignment = (
+        "ALIGNED"
+        if domain_comparison in {"EXACT_HOST", "ORGANIZATIONAL_ALIGNMENT"}
+        else "MISMATCH" if domain_comparison == "MISMATCH" else "UNKNOWN"
+    )
 
     # -----------------------------------------------------
     # RISK ASSESSMENT
@@ -322,14 +313,14 @@ def analyze_authentication(
             )
         })
 
-    if alignment == "MISMATCH" and dmarc != "PASS":
+    if alignment == "MISMATCH":
         findings.append({
             "type": "alignment",
             "severity": "HIGH",
             "title": "Sender and Return-Path domains differ",
             "description": (
-                "The visible sender domain and "
-                "Return-Path domain do not match."
+                "The visible sender and Return-Path have different organizational domains. "
+                "Authentication results are reported separately and do not establish message intent."
             )
         })
 
@@ -376,6 +367,7 @@ def analyze_authentication(
         "authentication_results_trusted": False,
         "dkim_signature_present": dkim_signature_present,
         "sender_return_path_alignment": alignment,
+        "sender_return_path_domain_comparison": domain_comparison,
         "risk": risk,
         "findings": findings,
         "finding_count": len(findings)

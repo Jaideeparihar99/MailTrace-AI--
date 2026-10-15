@@ -2,7 +2,8 @@
 
 import ipaddress
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlsplit, urlunsplit
+import idna
 
 
 # =========================================================
@@ -53,19 +54,38 @@ def normalize_ip(value: str) -> str | None:
 
 def normalize_url(value: str) -> str | None:
     value = _clean(value)
-
-    parsed = urlparse(value)
-
-    if parsed.scheme.lower() not in {
-        "http",
-        "https",
-    }:
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
         return None
-
-    if not parsed.hostname:
+    if scheme not in {"http", "https"} or not hostname:
         return None
+    try:
+        try:
+            host = str(ipaddress.ip_address(hostname))
+            if ":" in host:
+                host = f"[{host}]"
+        except ValueError:
+            host = idna.encode(hostname, uts46=True, std3_rules=True).decode("ascii").lower().rstrip(".")
+            if not normalize_domain(host):
+                return None
+    except (UnicodeError, ValueError):
+        return None
+    userinfo = parsed.netloc.rsplit("@", 1)[0] + "@" if "@" in parsed.netloc else ""
+    if port is not None and not (scheme == "http" and port == 80 or scheme == "https" and port == 443):
+        host = f"{host}:{port}"
+    path = parsed.path or "/"
+    return urlunsplit((scheme, userinfo + host, path, parsed.query, parsed.fragment))
 
-    return value
+
+def url_deduplication_key(value: str) -> str | None:
+    """Canonical identity: lowercase scheme/host, default ports removed;
+    path, query and fragment remain case-sensitive and otherwise unchanged.
+    """
+    return normalize_url(value)
 
 
 def normalize_domain(value: str) -> str | None:
@@ -166,19 +186,21 @@ def extract_urls(text: str) -> list[dict]:
         if not url:
             continue
 
-        key = url.lower()
+        key = url_deduplication_key(url)
+        if not key:
+            continue
 
         if key in seen:
             continue
 
         seen.add(key)
 
-        parsed = urlparse(url)
+        parsed = urlsplit(key)
 
         results.append({
-            "ioc": url,
+            "ioc": key,
             "ioc_type": "url",
-            "value": url,
+            "value": key,
             "domain": parsed.hostname.lower()
             if parsed.hostname
             else None,
@@ -216,14 +238,14 @@ def extract_domains(text: str) -> list[dict]:
     return results
 
 
-def extract_iocs(text: str) -> list[dict]:
+def extract_iocs(text: str, url_evidence: list[dict] | None = None) -> list[dict]:
     """
     Extract and normalize IP, IP:port, URL and domain IOCs.
 
     Values are deduplicated while preserving discovery order.
     """
 
-    if not text:
+    if not text and not url_evidence:
         return []
 
     results = []
@@ -236,6 +258,23 @@ def extract_iocs(text: str) -> list[dict]:
         extract_domains(text),
     ]
 
+    url_sources: dict[str, dict[str, list]] = {}
+    for evidence in url_evidence or []:
+        if not isinstance(evidence, dict):
+            continue
+        value = evidence.get("normalized_url") or evidence.get("original_url")
+        key = url_deduplication_key(str(value or ""))
+        if not key:
+            continue
+        current = url_sources.setdefault(key, {"original_values": [], "source_locations": []})
+        original = evidence.get("original_url")
+        if original and original not in current["original_values"]:
+            current["original_values"].append(original)
+        for location in evidence.get("source_locations", []):
+            if location not in current["source_locations"]:
+                current["source_locations"].append(location)
+        groups[2].append({"ioc": key, "ioc_type": "url", "value": key})
+
     for group in groups:
         for item in group:
             ioc = item.get("ioc")
@@ -243,12 +282,20 @@ def extract_iocs(text: str) -> list[dict]:
             if not ioc:
                 continue
 
-            key = ioc.strip().lower()
+            key = (
+                url_deduplication_key(ioc)
+                if item.get("ioc_type") == "url"
+                else ioc.strip().lower()
+            )
+            if not key:
+                continue
 
             if key in seen:
                 continue
 
             seen.add(key)
+            if item.get("ioc_type") == "url":
+                item.update(url_sources.get(key, {}))
             results.append(item)
 
     return results
