@@ -8,10 +8,10 @@
     "use strict";
 
     const API_URL =
-        "http://127.0.0.1:8000/api/threat-intelligence/live";
+        window.mailtraceApiUrl("/api/threat-intelligence/live");
 
     const STREAM_URL =
-        "http://127.0.0.1:8000/api/threat-intelligence/stream";
+        window.mailtraceApiUrl("/api/threat-intelligence/stream");
 
     const REFRESH_INTERVAL = 5000;
 

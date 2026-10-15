@@ -3042,6 +3042,9 @@ async def _analyze_email(
                     or body_for_ai.get("urls")
                     or []
                 ),
+                "url_intelligence": result.get("url_intelligence", {}),
+                "advanced_url_intelligence": result.get("advanced_url_intelligence", {}),
+                "link_deception_intelligence": result.get("link_deception_intelligence", {}),
                 "attachments": (
                     result.get("attachments")
                     or []
