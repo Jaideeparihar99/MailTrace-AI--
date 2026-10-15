@@ -11,6 +11,8 @@ from services.attachment_intelligence.file_type_analysis import (
     MAX_HEADER_READ,
     analyze_file_type,
 )
+from services.domain_alignment import normalized_host, organizational_domain
+from services.threat_intelligence.ioc_normalizer import URL_PATTERN, normalize_url, url_deduplication_key
 
 
 MAX_STATIC_ATTACHMENT_ANALYSES = 50
@@ -89,7 +91,8 @@ def parse_email(file_content: bytes, filename: str):
     html_body = extract_html_body(message)
     attachments = extract_attachments(message)
 
-    urls = extract_urls(body)
+    url_evidence = extract_url_evidence(body, html_body)
+    urls = [item["original_url"] for item in url_evidence]
 
     # ======================================
     # URL INTELLIGENCE
@@ -209,6 +212,11 @@ def parse_email(file_content: bytes, filename: str):
         },
 
         "urls": urls,
+        "url_evidence": url_evidence,
+        "url_summary": {
+            "unique_count": len(urls),
+            "occurrence_count": sum(len(item["source_locations"]) for item in url_evidence),
+        },
 
         # ==================================
         # URL INTELLIGENCE RESULT
@@ -407,34 +415,27 @@ def extract_html_body(message: Message):
 # URL EXTRACTION
 # ==========================================
 
-def extract_urls(text: str):
-
-    if not text:
-
-        return []
-
-
-    pattern = r"https?://[^\s<>\"]+"
-
-
-    urls = re.findall(
-        pattern,
-        text
-    )
-
-
-    # --------------------------------------
-    # Remove duplicate URLs
-    # --------------------------------------
-
-    unique_urls = list(
-        dict.fromkeys(
-            urls
-        )
-    )
+def extract_url_evidence(text: str, html_text: str = "") -> list[dict]:
+    """Extract unique URLs from MIME text/HTML while retaining all source offsets."""
+    found: dict[str, dict] = {}
+    for source, content in (("text/plain", text or ""), ("text/html", html_text or "")):
+        for match in URL_PATTERN.finditer(content):
+            original = match.group(0).rstrip(".,;:!?)]}>")
+            normalized = normalize_url(original)
+            key = url_deduplication_key(original)
+            if not normalized or not key:
+                continue
+            record = found.setdefault(key, {
+                "normalized_url": key,
+                "original_url": original,
+                "source_locations": [],
+            })
+            record["source_locations"].append({"part": source, "offset": match.start()})
+    return list(found.values())
 
 
-    return unique_urls
+def extract_urls(text: str, html_text: str = ""):
+    return [item["original_url"] for item in extract_url_evidence(text, html_text)]
 
 
 # ==========================================
@@ -913,7 +914,9 @@ def analyze_threat(
         if (
             sender_domain
             and reply_domain
-            and sender_domain != reply_domain
+            and organizational_domain(sender_domain)
+            and organizational_domain(reply_domain)
+            and organizational_domain(sender_domain) != organizational_domain(reply_domain)
         ):
 
             score += 20
@@ -961,7 +964,9 @@ def analyze_threat(
         if (
             sender_domain
             and return_domain
-            and sender_domain != return_domain
+            and organizational_domain(sender_domain)
+            and organizational_domain(return_domain)
+            and organizational_domain(sender_domain) != organizational_domain(return_domain)
         ):
 
             score += 10
@@ -1090,19 +1095,30 @@ def analyze_threat(
     ]
 
 
-    matched_urgency = [
-
-        term
-
-        for term in urgency_terms
-
-        if (
-            term in subject
-            or
-            term in body_lower
-        )
-
-    ]
+    # Urgency is a risk signal only when it accompanies a recipient action.
+    # Ignore quoted examples, explicit negation and terms isolated in boilerplate.
+    unquoted_text = re.sub(
+        r"""“[^”]*”|"[^"]*"|‘[^’]*’|(?<!\w)'[^'\n]*'(?!\w)""",
+        " ",
+        f"{subject}\n{body_lower}",
+    )
+    clauses = [part.strip() for part in re.split(r"[.!?;\n]+", unquoted_text) if part.strip()]
+    negation_terms = ("never ask", "do not", "don't", "does not", "will not", "won't",
+                      "not required", "no need to", "not asking", "without asking")
+    clauses = [part for part in clauses if not any(term in part for term in negation_terms)]
+    actionable_terms = (
+        "verify your account", "verify your identity", "enter your password",
+        "provide your password", "sign in", "log in", "click here", "open the link",
+        "transfer funds", "send payment", "wire transfer", "update your payment",
+        "download the attachment", "open the attachment", "reply with",
+    )
+    matched_urgency = []
+    for index in range(len(clauses)):
+        context = " ".join(clauses[max(0, index - 1):index + 2])
+        if not any(term in context for term in actionable_terms):
+            continue
+        matched_urgency.extend(term for term in urgency_terms if term in context)
+    matched_urgency = list(dict.fromkeys(matched_urgency))
 
 
     if matched_urgency:
@@ -1237,19 +1253,7 @@ def analyze_threat(
 # ==========================================
 
 def extract_domain(value: str):
-
-    match = re.search(
-        r"@([A-Za-z0-9.-]+\.[A-Za-z]{2,})",
-        value
-    )
-
-
-    if match:
-
-        return match.group(1).lower()
-
-
-    return None
+    return normalized_host(value)
 
 
 

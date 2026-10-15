@@ -3239,8 +3239,41 @@ def route_case_to_soc(case_id: str, tenant_id: str, reporter_subject: str, *, re
         if prior and prior["assigned_analyst"] and not force:
             # Scheduler races, queue refreshes, and duplicate employee reports must
             # not silently move an already-owned case to another analyst.
+            current_priority, sla_minutes = _case_priority_and_sla(
+                case["severity"], case["threat_score"]
+            )
+            priority_rank = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}
+            if priority_rank.get(current_priority, 4) < priority_rank.get(prior["priority"], 4):
+                new_deadline = connection.execute(
+                    "SELECT datetime('now', ?)", (f"+{sla_minutes} minutes",)
+                ).fetchone()[0]
+                deadline = min(str(prior["sla_deadline"] or new_deadline), new_deadline)
+                connection.execute(
+                    "UPDATE case_routing SET priority=?, sla_deadline=?, "
+                    "last_activity_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE case_id=? AND tenant_id=?",
+                    (current_priority, deadline, case_id, tenant_id),
+                )
+                reason = "risk_priority_escalated_without_reassignment"
+                details = {
+                    "previous_priority": prior["priority"],
+                    "priority": current_priority,
+                    "sla_deadline": deadline,
+                    "assigned_analyst": prior["assigned_analyst"],
+                }
+                connection.execute(
+                    "INSERT INTO case_routing_events "
+                    "(case_id, tenant_id, actor_subject, action, reason, details_json) "
+                    "VALUES (?, ?, ?, 'PRIORITY_ESCALATED', ?, ?)",
+                    (case_id, tenant_id, actor_subject, reason,
+                     json.dumps(details, separators=(",", ":"))),
+                )
             connection.commit()
-            return dict(prior)
+            refreshed = connection.execute(
+                "SELECT * FROM case_routing WHERE case_id=? AND tenant_id=?",
+                (case_id, tenant_id),
+            ).fetchone()
+            return dict(refreshed)
         active_claim = connection.execute("""
             SELECT assigned_analyst FROM case_claims
             WHERE case_id=? AND tenant_id=? AND status='ACTIVE'

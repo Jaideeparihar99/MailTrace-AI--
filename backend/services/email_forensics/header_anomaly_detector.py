@@ -4,6 +4,7 @@ import re
 from collections import Counter
 from email.utils import parseaddr
 from typing import Any
+from services.domain_alignment import compare_domains, normalized_host
 
 
 SENSITIVE_HEADERS = {
@@ -34,10 +35,7 @@ def _extract_domain(email_address: str) -> str:
     Extract domain from an email address.
     """
 
-    if not email_address or "@" not in email_address:
-        return ""
-
-    return email_address.rsplit("@", 1)[1].lower()
+    return normalized_host(email_address) or ""
 
 
 def _extract_message_id_domain(message_id: str | None) -> str:
@@ -237,7 +235,7 @@ def detect_header_anomalies(
     if (
         from_domain
         and reply_to_domain
-        and from_domain != reply_to_domain
+        and compare_domains(from_domain, reply_to_domain) == "MISMATCH"
     ):
 
         _add_finding(
@@ -271,7 +269,7 @@ def detect_header_anomalies(
     if (
         from_domain
         and return_path_domain
-        and from_domain != return_path_domain
+        and compare_domains(from_domain, return_path_domain) == "MISMATCH"
     ):
 
         _add_finding(
@@ -301,7 +299,7 @@ def detect_header_anomalies(
     if (
         from_domain
         and sender_domain
-        and from_domain != sender_domain
+        and compare_domains(from_domain, sender_domain) == "MISMATCH"
     ):
 
         _add_finding(
@@ -551,6 +549,9 @@ def detect_header_anomalies(
             "return_path_domain": return_path_domain,
             "sender_email": sender_email,
             "sender_domain": sender_domain,
+            "from_reply_to_comparison": compare_domains(from_domain, reply_to_domain),
+            "from_return_path_comparison": compare_domains(from_domain, return_path_domain),
+            "from_sender_comparison": compare_domains(from_domain, sender_domain),
         },
 
         "findings": findings,

@@ -133,11 +133,11 @@ def build_mail_flow_decision(analysis: dict[str, Any]) -> dict[str, Any]:
     assessment_incomplete = (
         score_missing
         or score_invalid
-        or verdict not in {"LOW RISK", "BENIGN", "LEGITIMATE", "MEDIUM", "SUSPICIOUS", "HIGH", "HIGH RISK", "CRITICAL"}
+        or verdict not in {"LOW", "LOW RISK", "BENIGN", "LEGITIMATE", "MEDIUM", "SUSPICIOUS", "HIGH", "HIGH RISK", "CRITICAL"}
         or confidence not in {"LOW", "MEDIUM", "HIGH"}
         or not confidence_provenance_valid
         or confidence_decision == "INSUFFICIENT_EVIDENCE"
-        or (confidence == "HIGH" and not high_confidence_supported)
+        or (confidence == "HIGH" and confidence_decision in {"HIGH_CONFIDENCE_THREAT", "CORROBORATED_THREAT"} and not high_confidence_supported)
         or attachment_scan_incomplete
     )
 
