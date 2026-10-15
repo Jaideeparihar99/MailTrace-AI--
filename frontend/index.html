@@ -10,7 +10,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 
-<link rel="stylesheet" href="style.css?v=20261010-clean-css">
+<link rel="stylesheet" href="style.css?v=20261015-header-spacing-fix">
 
     <!-- Exact reference world-map libraries -->
     <script defer src="https://cdn.jsdelivr.net/npm/d3@7"></script>
@@ -20,12 +20,6 @@
 </head>
 
 <body>
-
-    <script>
-        if (window.location.protocol === "file:") {
-            document.body.classList.add("file-origin-mode");
-        }
-    </script>
 
     <!-- ================= SIDEBAR ================= -->
 
@@ -110,14 +104,6 @@
     <!-- ================= MAIN ================= -->
 
     <main class="main-content">
-
-        <aside class="file-origin-notice" role="alert" aria-live="polite">
-            <div>
-                <strong>Open MailTrace through its local server</strong>
-                <span>Direct file mode blocks dashboard and API requests. Start MailTrace, then use the local web address.</span>
-            </div>
-            <a href="http://127.0.0.1:5503/index.html">Open the working website</a>
-        </aside>
 
         <!-- TOPBAR -->
 
@@ -1416,7 +1402,7 @@
 
 <script>window.MAILTRACE_API_BASE = "http://127.0.0.1:8002";</script>
 <script src="soc-auth.js?v=20261010-sla-workflow"></script>
-<script src="script.js?v=20261010-sla-workflow"></script>
+<script src="script.js?v=20261015-sla-action-delegation"></script>
 
 
     <!-- <script src="header-animation.js"></script> -->

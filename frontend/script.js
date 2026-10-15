@@ -8604,7 +8604,9 @@ const existingResult =
             }
         }
 
-        document.getElementById("socSlaAlertsContent")?.addEventListener("click", async (event) => {
+        // The Cases page (including socSlaAlertsContent) is injected dynamically by
+        // loadCases(), so bind on the document and delegate to the current alert row.
+        document.addEventListener("click", async (event) => {
             const button = event.target.closest("button[data-sla-action][data-alert-id]");
             if (!button || button.disabled) return;
             const alertId = Number(button.dataset.alertId);
@@ -8624,6 +8626,8 @@ const existingResult =
             } catch (error) {
                 button.disabled = false;
                 button.textContent = oldLabel;
+                const host = document.getElementById("socSlaAlertsContent");
+                if (!host) return;
                 const prior = host.querySelector(".soc-sla-action-error");
                 if (prior) prior.remove();
                 const message = document.createElement("p");
