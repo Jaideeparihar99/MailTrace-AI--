@@ -91,7 +91,7 @@ from services.threat_intelligence.sync_service import (
 )
 from services.campaign_correlation import correlate_campaigns
 from services.email_ai.engine import analyze_email_ai
-from services.email_ai.intelligence_fusion import analyze_email_intelligence
+from services.email_ai.intelligence_fusion import ENGINE_VERSION as FUSION_ENGINE_VERSION, analyze_email_intelligence
 from services.response_management import manage_response
 from copy import deepcopy
 from services.ioc_timeline import build_ioc_timeline
@@ -254,6 +254,9 @@ async def lifespan(_: FastAPI):
         raise RuntimeError("MAILTRACE_TI_SYNC_INTERVAL_MINUTES must be 0 or an integer from 15 to 1440.") from error
     if ti_sync_interval_minutes != 0 and not 15 <= ti_sync_interval_minutes <= 1440:
         raise RuntimeError("MAILTRACE_TI_SYNC_INTERVAL_MINUTES must be 0 or an integer from 15 to 1440.")
+    if os.getenv("MAILTRACE_DISABLE_BACKGROUND_WORKERS", "").strip().lower() in {"1", "true", "yes"}:
+        yield
+        return
     worker = asyncio.create_task(_sla_escalation_worker(ti_sync_interval_minutes))
     try:
         yield
@@ -1367,7 +1370,8 @@ def calculate_ioc_threat_score(threat_intelligence):
         return {
             "score": 0,
             "matched_iocs": 0,
-            "evidence": []
+            "evidence": [],
+            "status": "unavailable",
         }
 
     matches = (
@@ -1382,7 +1386,9 @@ def calculate_ioc_threat_score(threat_intelligence):
         return {
             "score": 0,
             "matched_iocs": 0,
-            "evidence": []
+            "evidence": [],
+            "status": threat_intelligence.get("status", "unavailable"),
+            "coverage_status": threat_intelligence.get("coverage_status", "UNKNOWN"),
         }
 
     ioc_score = 0
@@ -1470,7 +1476,9 @@ def calculate_ioc_threat_score(threat_intelligence):
     return {
         "score": ioc_score,
         "matched_iocs": len(evidence),
-        "evidence": evidence
+        "evidence": evidence,
+        "status": threat_intelligence.get("status", "matched" if evidence else "no_matches"),
+        "coverage_status": threat_intelligence.get("coverage_status", "UNKNOWN"),
     }
 
 
@@ -2753,6 +2761,20 @@ def _sanitize_forensics_smtp_context(context: object) -> dict[str, str] | None:
     return sanitized or None
 
 
+def _resolve_final_email_score(fusion: object, rule_score: int, ioc_score: int) -> dict[str, object]:
+    """Select the canonical fusion score or disclose the degraded legacy fallback."""
+    fusion = fusion if isinstance(fusion, dict) else {}
+    score = fusion.get("unified_risk_score")
+    if fusion.get("status") == "ANALYZED" and isinstance(score, (int, float)) and 0 <= score <= 100:
+        return {"score": round(score), "source": "intelligence_fusion", "degraded": False,
+                "fusion_status": "ANALYZED", "reason": "Canonical fusion result was valid."}
+    fallback = min(max(0, int(rule_score or 0)) + max(0, int(ioc_score or 0)), 100)
+    status = str(fusion.get("status", "NOT_PROVIDED")).upper()
+    reason = "Fusion result was missing, failed, or invalid; parser plus IOC fallback was used."
+    return {"score": fallback, "source": "parser_rules_plus_ioc_fallback", "degraded": True,
+            "fusion_status": status, "reason": reason}
+
+
 async def _analyze_email(
     file: UploadFile,
     trusted_smtp_context: dict[str, str] | None = None,
@@ -3100,11 +3122,18 @@ async def _analyze_email(
             )
 
             normalized_iocs = extract_iocs(
-                email_body
+                email_body,
+                url_evidence=result.get("url_evidence", []),
             )
 
             threat_intelligence["ioc_summary"] = (
                 summarize_iocs(normalized_iocs)
+            )
+            url_summary = result.setdefault("url_summary", {})
+            url_summary["ioc_unique_count"] = threat_intelligence["ioc_summary"]["url"]
+            url_summary["counts_consistent"] = (
+                url_summary.get("unique_count", 0)
+                == url_summary["ioc_unique_count"]
             )
 
             threat_intelligence["iocs"] = (
@@ -3125,11 +3154,11 @@ async def _analyze_email(
 
                 threat_intelligence["matches"] = matches
 
-                threat_intelligence["matched_count"] = (
-                    len(matches)
-                )
+                threat_intelligence["matched_count"] = sum(
+                    1 for records in matches.values() if records
+                ) if isinstance(matches, dict) else 0
 
-                if matches:
+                if threat_intelligence["matched_count"]:
                     threat_intelligence["status"] = "matched"
                 else:
                     threat_intelligence["status"] = "no_matches"
@@ -3210,10 +3239,11 @@ async def _analyze_email(
             )
 
         except Exception as fusion_error:
+            api_logger.error("intelligence_fusion_failed error_type=%s", type(fusion_error).__name__)
             intelligence_fusion = {
                 "status": "ERROR",
                 "engine": "mailtrace-ai-intelligence-fusion",
-                "version": "2.3.0",
+                "version": FUSION_ENGINE_VERSION,
                 "classification": (
                     ai_result.get(
                         "classification",
@@ -3242,7 +3272,8 @@ async def _analyze_email(
                 "unified_risk_score": 0.0,
                 "risk_tier": "LOW",
                 "decision": "FUSION_ERROR",
-                "error": str(fusion_error),
+                "error": "Fusion analysis failed; a disclosed fallback score may be used.",
+                "error_type": type(fusion_error).__name__,
                 "governance": {
                     "read_only": True,
                     "persistence": False,
@@ -3272,25 +3303,18 @@ async def _analyze_email(
             )
             or 0
         )
-        fusion_score = intelligence_fusion.get("unified_risk_score")
-        if (
-            intelligence_fusion.get("status") == "ANALYZED"
-            and isinstance(fusion_score, (int, float))
-            and 0 <= fusion_score <= 100
-        ):
-            combined_threat_score = round(fusion_score)
-            score_source = "intelligence_fusion"
-        else:
-            # Safe fallback when fusion fails: retain the legacy parser + IOC score.
-            combined_threat_score = min(
-                rule_threat_score + ioc_threat_score.get("score", 0),
-                100,
-            )
-            score_source = "parser_rules_plus_ioc_fallback"
+        score_resolution = _resolve_final_email_score(
+            intelligence_fusion, rule_threat_score, ioc_threat_score.get("score", 0)
+        )
+        combined_threat_score = int(score_resolution["score"])
+        score_source = str(score_resolution["source"])
 
         result["threat_analysis"]["rule_score"] = rule_threat_score
         result["threat_analysis"]["score"] = combined_threat_score
         result["threat_analysis"]["score_source"] = score_source
+        result["threat_analysis"]["score_source_reason"] = score_resolution["reason"]
+        result["threat_analysis"]["degraded_mode"] = score_resolution["degraded"]
+        result["threat_analysis"]["fusion_status"] = score_resolution["fusion_status"]
         
                 # -------------------------------------
         # UPDATE VERDICT / CONFIDENCE

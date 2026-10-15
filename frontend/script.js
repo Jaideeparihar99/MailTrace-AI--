@@ -1307,6 +1307,10 @@
             const iocSummary =
                 threatIntelligence.ioc_summary || {};
 
+            const urlCount = Number(
+                analysis.url_summary?.unique_count ?? urls.length
+            );
+
             const normalizedIOCs =
                 Array.isArray(threatIntelligence.iocs)
                     ? threatIntelligence.iocs
@@ -1337,7 +1341,20 @@ const iocEvidence =
 const iocScoreBand = iocScore >= 70 ? "high" : iocScore >= 35 ? "medium" : "low";
 const iocScoreStatus = iocEvidence.length || iocMatchedCount
     ? "Evidence evaluated"
-    : "No IOC matches returned";
+    : threatIntelStatus === "error" || threatIntelStatus === "unavailable"
+        ? "Lookup unavailable"
+        : threatIntelStatus === "coverage_limited"
+            ? "Coverage limited"
+            : threatIntelStatus === "no_iocs"
+                ? "No indicators extracted"
+                : "No IOC matches";
+const iocResultMessage = threatIntelStatus === "error" || threatIntelStatus === "unavailable"
+    ? "Threat intelligence lookup was unavailable. No match result is not a safe verdict."
+    : threatIntelStatus === "coverage_limited"
+        ? "Threat intelligence coverage is limited. No match result is not a safe verdict."
+        : threatIntelStatus === "no_iocs"
+            ? "No URL, domain, or IP indicators were extracted. This does not establish that the message is safe."
+            : "No matching IOC evidence was returned. This alone does not establish that the message is safe.";
 
             // This renderer is called before the later fusion UI block is
             // initialized, so read its data from the current analysis payload.
@@ -1987,7 +2004,7 @@ const existingResult =
                         <div class="result-overview-metrics" aria-label="Evidence summary">
                             <div><strong>${scoreBreakdown.length}</strong><span>Scoring factors</span></div>
                             <div><strong>${matchedIOCCount}</strong><span>Threat intel matches</span></div>
-                            <div><strong>${urls.length}</strong><span>URLs extracted</span></div>
+                            <div><strong>${urlCount}</strong><span>URLs extracted</span></div>
                             <div><strong>${attachments.length}</strong><span>Attachments</span></div>
                             <div><strong>${receivedChain.length}</strong><span>Relay hops</span></div>
                         </div>
@@ -2130,7 +2147,7 @@ const existingResult =
                         <div class="indicator-number">
 
                             <strong>
-                                ${urls.length}
+                                ${urlCount}
                             </strong>
 
                             <span>
@@ -2187,7 +2204,7 @@ const existingResult =
                             <div class="mt-ti-summary-item">
 
                                 <div class="mt-ti-summary-value">
-                                    ${normalizedIOCs.length}
+                                    ${Number(iocSummary.total ?? normalizedIOCs.length)}
                                 </div>
 
                                 <div class="mt-ti-summary-label">
@@ -2200,9 +2217,7 @@ const existingResult =
                             <div class="mt-ti-summary-item">
 
                                 <div class="mt-ti-summary-value">
-                                    ${Number(
-                                        iocSummary.url || 0
-                                    )}
+                                    ${urlCount}
                                 </div>
 
                                 <div class="mt-ti-summary-label">
@@ -2439,7 +2454,7 @@ const existingResult =
 
                                         : `
                                             <div class="mt-ti-empty">
-                                                No ThreatFox matches found for the extracted IOCs.
+                                                ${escapeHTML(iocResultMessage)}
                                             </div>
                                         `
                                 }
@@ -2579,7 +2594,7 @@ const existingResult =
                             <div class="ioc-score-heading"><span>IOC RISK SCORE</span><span>0–100</span></div>
                             <div class="ioc-score-value"><strong>${escapeHTML(String(iocScore))}</strong><span>/ 100</span></div>
                             <div class="ioc-score-track" role="img" aria-label="IOC risk score ${escapeHTML(String(iocScore))} out of 100"><span style="width:${Math.max(0, Math.min(100, iocScore))}%"></span></div>
-                            <p>${iocEvidence.length || iocMatchedCount ? "Score reflects IOC evidence returned by the analysis pipeline." : "No matching IOC evidence was returned. This alone does not establish that the message is safe."}</p>
+                            <p>${iocEvidence.length || iocMatchedCount ? "Score reflects IOC evidence returned by the analysis pipeline." : escapeHTML(iocResultMessage)}</p>
                         </div>
                         <div class="ioc-score-facts">
                             <div><span>Matched indicators</span><strong>${escapeHTML(String(iocMatchedCount))}</strong><small>Indicators matched against available threat intelligence</small></div>

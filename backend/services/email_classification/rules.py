@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any
+from services.domain_alignment import domains_differ, normalized_host
 
 
 MAX_TEXT_CHARS = 2 * 1024 * 1024
@@ -356,15 +357,15 @@ def collect_rule_signals(
         )
 
     if reply_text and sender_text:
-        sender_domain = sender_text.split("@")[-1].lower()
-        reply_domain = reply_text.split("@")[-1].lower()
+        sender_domain = normalized_host(sender_text)
+        reply_domain = normalized_host(reply_text)
 
         if (
             "@" in sender_text
             and "@" in reply_text
             and sender_domain
             and reply_domain
-            and sender_domain != reply_domain
+            and domains_differ(sender_domain, reply_domain)
         ):
             signals.append(
                 {

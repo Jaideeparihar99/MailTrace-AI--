@@ -230,6 +230,10 @@ def test_production_legacy_cases_are_quarantined_until_mapped(tmp_path, monkeypa
     legacy_db = tmp_path / "legacy-prod.db"
     monkeypatch.setattr(db, "DATABASE_PATH", legacy_db)
     monkeypatch.setenv("MAILTRACE_ENV", "production")
+    monkeypatch.setenv(
+        "MAILTRACE_DATA_ENCRYPTION_KEY",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    )
     connection = sqlite3.connect(legacy_db)
     connection.execute("CREATE TABLE cases (id INTEGER PRIMARY KEY, case_id TEXT UNIQUE NOT NULL, title TEXT NOT NULL, description TEXT, severity TEXT DEFAULT 'LOW', status TEXT DEFAULT 'OPEN', threat_score INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     connection.execute("INSERT INTO cases(case_id,title) VALUES ('LEGACY-2','Legacy production case')")
