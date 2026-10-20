@@ -5,6 +5,7 @@ import json
 
 from .dataset import load_rows, validate_rows
 from .model import train_model
+from .training_readiness import require_training_approval
 
 
 def main() -> int:
@@ -21,12 +22,20 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--approval-manifest",
+        default=None,
+        help="Dataset-hash-bound JSON approval record signed off by rights, independent label, and privacy reviewers.",
+    )
+
+    parser.add_argument(
         "--output",
         default="models/email_ai",
         help="Output model directory.",
     )
 
     args = parser.parse_args()
+
+    approval = require_training_approval(args.input, args.approval_manifest)
 
     rows = load_rows(
         args.input
@@ -40,6 +49,7 @@ def main() -> int:
         rows=validation["rows"],
         output_dir=args.output,
         dataset_path=args.input,
+        approval_manifest=args.approval_manifest,
     )
 
     print(
@@ -48,6 +58,7 @@ def main() -> int:
                 "status": "TRAINING_COMPLETE",
                 "dataset": validation,
                 "model": result,
+                "training_approval": approval,
             },
             indent=2,
             ensure_ascii=False,

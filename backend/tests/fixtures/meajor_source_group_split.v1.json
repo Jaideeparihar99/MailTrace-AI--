@@ -1,0 +1,103 @@
+{
+  "dataset_path": "backend/data/email_ai/normalized/meajor_phishing_binary.jsonl",
+  "dataset_rows": 106290,
+  "dataset_sha256": "c0fe5fef82ab284b74e19078b54dc4820de49ef29e7576731abff3c8ecaf3ac5",
+  "exact_normalized_text_duplicate_audit": {
+    "conflicting_label_groups": 0,
+    "cross_source_duplicate_groups": 0,
+    "cross_source_duplicate_rows": 0,
+    "duplicate_groups": 28,
+    "duplicate_rows_beyond_first": 31,
+    "normalization": "Unicode casefold plus whitespace collapse; punctuation and evidence-bearing components preserved"
+  },
+  "folds": [
+    {
+      "fold_id": "holdout-trec5",
+      "holdout_class_counts": {
+        "LEGITIMATE": 27796,
+        "PHISHING": 19569
+      },
+      "holdout_rows": 47365,
+      "holdout_source": "trec5",
+      "training_class_counts": {
+        "LEGITIMATE": 30566,
+        "PHISHING": 28359
+      },
+      "training_rows": 58925,
+      "training_sources": [
+        "trec6",
+        "trec7"
+      ]
+    },
+    {
+      "fold_id": "holdout-trec6",
+      "holdout_class_counts": {
+        "LEGITIMATE": 11188,
+        "PHISHING": 3790
+      },
+      "holdout_rows": 14978,
+      "holdout_source": "trec6",
+      "training_class_counts": {
+        "LEGITIMATE": 47174,
+        "PHISHING": 44138
+      },
+      "training_rows": 91312,
+      "training_sources": [
+        "trec5",
+        "trec7"
+      ]
+    },
+    {
+      "fold_id": "holdout-trec7",
+      "holdout_class_counts": {
+        "LEGITIMATE": 19378,
+        "PHISHING": 24569
+      },
+      "holdout_rows": 43947,
+      "holdout_source": "trec7",
+      "training_class_counts": {
+        "LEGITIMATE": 38984,
+        "PHISHING": 23359
+      },
+      "training_rows": 62343,
+      "training_sources": [
+        "trec5",
+        "trec6"
+      ]
+    }
+  ],
+  "group_field": "source",
+  "limitations": [
+    "Source-disjoint folds prevent source-family overlap but are not a temporal evaluation.",
+    "Near-duplicate similarity and campaign identity are not available as explicit group fields and were not fully audited.",
+    "Source labels remain proxy labels; this split does not make them human-adjudicated ground truth.",
+    "This manifest contains only aggregate metadata and no message text or per-message identifiers."
+  ],
+  "manifest_id": "mailtrace-meajor-source-grouped-splits-v1",
+  "schema_version": "1.0",
+  "sources": {
+    "trec5": {
+      "class_counts": {
+        "LEGITIMATE": 27796,
+        "PHISHING": 19569
+      },
+      "rows": 47365
+    },
+    "trec6": {
+      "class_counts": {
+        "LEGITIMATE": 11188,
+        "PHISHING": 3790
+      },
+      "rows": 14978
+    },
+    "trec7": {
+      "class_counts": {
+        "LEGITIMATE": 19378,
+        "PHISHING": 24569
+      },
+      "rows": 43947
+    }
+  },
+  "strategy": "three-fold leave-one-source-out; every row from a source stays together",
+  "training_performed": false
+}

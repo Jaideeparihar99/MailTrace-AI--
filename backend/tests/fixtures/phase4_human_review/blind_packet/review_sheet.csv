@@ -1,0 +1,9 @@
+review_case_id,email_file,reviewer_label,reviewer_severity,confidence,evidence_notes,reviewer_id_or_role,reviewer_relationship_to_author,reviewed_at_utc,review_status,adjudicated_label,adjudicator_id_or_role,adjudication_notes,adjudicated_at_utc
+RV-9443EA92B6,review_emails/rv-9443ea92b6.eml,,,,,,,,PENDING,,,,
+RV-43D167211C,review_emails/rv-43d167211c.eml,,,,,,,,PENDING,,,,
+RV-E40C8F6CE8,review_emails/rv-e40c8f6ce8.eml,,,,,,,,PENDING,,,,
+RV-9C08CA1504,review_emails/rv-9c08ca1504.eml,,,,,,,,PENDING,,,,
+RV-00042E3A8A,review_emails/rv-00042e3a8a.eml,,,,,,,,PENDING,,,,
+RV-06754950E0,review_emails/rv-06754950e0.eml,,,,,,,,PENDING,,,,
+RV-33532B5880,review_emails/rv-33532b5880.eml,,,,,,,,PENDING,,,,
+RV-3D1597629A,review_emails/rv-3d1597629a.eml,,,,,,,,PENDING,,,,

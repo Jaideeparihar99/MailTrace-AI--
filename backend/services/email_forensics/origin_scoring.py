@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any
 
@@ -12,10 +12,10 @@ def score_origin_candidates(
     ip_intelligence: dict[str, dict[str, Any]] | None = None
 ) -> list[dict[str, Any]]:
     """
-    Rank possible origin IP candidates.
+    Rank observed relay IPs for analyst review.
 
-    This is evidence-based ranking only.
-    It does NOT claim attribution or identify an attacker.
+    Uploaded Received headers are untrusted input. This heuristic does not
+    identify a sender origin, person, or attacker.
     """
 
     ip_intelligence = ip_intelligence or {}
@@ -49,16 +49,53 @@ def score_origin_candidates(
                     "ip": ip,
                     "score": 0,
                     "hop": hop_number,
+                    "source_hops": [],
+                    "source_header_indices": [],
+                    "candidate_type": "OBSERVED_RELAY_IP",
+                    "attribution_status": "UNVERIFIED_NOT_SENDER_ORIGIN",
+                    "trust_state": "UNVERIFIED_MESSAGE_HEADER",
+                    "score_semantics": "Analyst-priority heuristic from routability and available threat evidence; not source attribution or origin confidence.",
                     "classification": None,
                     "hostname": None,
                     "organization": None,
                     "asn": None,
+                    "provider_sources": [],
+                    "network_classification": "UNKNOWN",
                     "risk": None,
                     "risk_score": None,
                     "confidence": None,
                     "reasons": [],
                 }
             )
+
+            if hop_number is not None and hop_number not in candidate["source_hops"]:
+                candidate["source_hops"].append(hop_number)
+            header_index = hop.get("header_index")
+            if header_index is not None and header_index not in candidate["source_header_indices"]:
+                candidate["source_header_indices"].append(header_index)
+
+            for provider in intelligence.get("provider_status", []) or []:
+                if not isinstance(provider, dict):
+                    continue
+                source_record = {
+                    "provider": provider.get("provider"),
+                    "source": provider.get("source"),
+                    "status": provider.get("status", "UNKNOWN"),
+                    "lookup_timestamp": provider.get("lookup_timestamp"),
+                }
+                if source_record not in candidate["provider_sources"]:
+                    candidate["provider_sources"].append(source_record)
+
+            legacy_network = intelligence.get("network_intelligence") or {}
+            if isinstance(legacy_network, dict) and legacy_network.get("provider"):
+                source_record = {
+                    "provider": legacy_network.get("provider"),
+                    "source": legacy_network.get("source"),
+                    "status": legacy_network.get("status", "UNKNOWN"),
+                    "lookup_timestamp": legacy_network.get("lookup_timestamp"),
+                }
+                if source_record not in candidate["provider_sources"]:
+                    candidate["provider_sources"].append(source_record)
 
             # -------------------------------------------------
             # CLASSIFICATION
@@ -95,6 +132,13 @@ def score_origin_candidates(
 
             is_documentation = (
                 intelligence.get("is_documentation") is True
+                or relay_classification == "DOCUMENTATION"
+            )
+            is_non_public = (
+                intelligence.get("is_global") is False
+                or intelligence.get("enrichment_status") == "NOT_PUBLIC"
+                or (relay_classification is not None and relay_classification != "PUBLIC")
+                or intelligence.get("classification") not in (None, "PUBLIC")
             )
 
             # -------------------------------------------------
@@ -137,6 +181,13 @@ def score_origin_candidates(
 
                 continue
 
+            if is_non_public:
+                candidate["score"] = 0
+                candidate["reasons"] = [
+                    "Non-public or special-use IP; not considered a public origin candidate."
+                ]
+                continue
+
             # -------------------------------------------------
             # PUBLIC ROUTABILITY
             # -------------------------------------------------
@@ -146,36 +197,9 @@ def score_origin_candidates(
             candidate["reasons"].append(
                 "Publicly routable IP candidate."
             )
-
-            # -------------------------------------------------
-            # RELAY POSITION
-            # -------------------------------------------------
-
-            if isinstance(hop_number, int):
-
-                if hop_number == 1:
-
-                    candidate["score"] += 20
-
-                    candidate["reasons"].append(
-                        "Appears at the earliest observed relay position."
-                    )
-
-                elif hop_number == 2:
-
-                    candidate["score"] += 12
-
-                    candidate["reasons"].append(
-                        "Appears near the beginning of the observed relay chain."
-                    )
-
-                elif hop_number <= 4:
-
-                    candidate["score"] += 6
-
-                    candidate["reasons"].append(
-                        "Appears relatively early in the observed relay chain."
-                    )
+            candidate["reasons"].append(
+                "An observed relay IP does not prove sender origin."
+            )
 
             # -------------------------------------------------
             # REVERSE DNS
@@ -186,10 +210,9 @@ def score_origin_candidates(
             if hostname:
 
                 candidate["hostname"] = hostname
-                candidate["score"] += 5
 
                 candidate["reasons"].append(
-                    "Reverse DNS hostname observed."
+                    "Reverse-DNS hostname reported by the configured resolver; this is network context, not identity proof."
                 )
 
             # -------------------------------------------------
@@ -201,10 +224,9 @@ def score_origin_candidates(
             if organization:
 
                 candidate["organization"] = organization
-                candidate["score"] += 5
 
                 candidate["reasons"].append(
-                    "Network organization identified."
+                    "Network organization reported by an enrichment provider; this does not identify the message sender."
                 )
 
             # -------------------------------------------------
@@ -216,10 +238,9 @@ def score_origin_candidates(
             if asn:
 
                 candidate["asn"] = asn
-                candidate["score"] += 5
 
                 candidate["reasons"].append(
-                    "ASN identified."
+                    "ASN reported by an enrichment provider; this does not establish hosting, VPN, proxy or Tor status."
                 )
 
             # -------------------------------------------------
@@ -265,11 +286,9 @@ def score_origin_candidates(
             # -------------------------------------------------
 
             if intelligence.get("is_hosting") is True:
-
-                candidate["score"] += 2
-
+                candidate["network_classification"] = "PROVIDER_REPORTED_HOSTING"
                 candidate["reasons"].append(
-                    "IP is associated with hosting or data-center infrastructure."
+                    "A configured provider reported a hosting flag; this does not identify the sender or establish malicious intent."
                 )
 
     # =========================================================

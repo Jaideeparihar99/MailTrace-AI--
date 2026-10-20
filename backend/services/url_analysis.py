@@ -343,14 +343,8 @@ def analyze_url(url: str):
     # Brand indicators
     # --------------------------------------
 
-    if brand_indicators:
-
-        risk_score += 25
-
-        reasons.append(
-            "Domain contains a known brand name "
-            "and may require impersonation analysis."
-        )
+    # Brand text is retained as context only. A legitimate brand hostname or
+    # an ordinary string resemblance is not an independent threat finding.
 
 
     # --------------------------------------

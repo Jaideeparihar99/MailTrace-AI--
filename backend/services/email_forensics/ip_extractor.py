@@ -1,8 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import ipaddress
 import re
 from typing import Any
+
+from services.ip_address_policy import classify_ip
 
 
 # =========================================================
@@ -12,6 +14,8 @@ from typing import Any
 IP_PATTERN = re.compile(
     r"(?<![0-9A-Fa-f:.])"
     r"("
+    r"::ffff:(?:\d{1,3}\.){3}\d{1,3}"
+    r"|"
     r"(?:\d{1,3}\.){3}\d{1,3}"
     r"|"
     r"(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}"
@@ -32,7 +36,6 @@ def extract_ip_candidates(
     """
 
     candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
 
     for header_index, header in enumerate(
         received_headers
@@ -41,50 +44,33 @@ def extract_ip_candidates(
         if not header:
             continue
 
-        matches = IP_PATTERN.findall(header)
+        matches = list(IP_PATTERN.finditer(header))
 
-        for raw_ip in matches:
+        for match in matches:
+            raw_ip = match.group(1)
 
-            try:
-                address = ipaddress.ip_address(
-                    raw_ip
-                )
-            except ValueError:
-                continue
+            policy = classify_ip(raw_ip)
+            address = None
+            if policy["valid"]:
+                try:
+                    address = ipaddress.ip_address(raw_ip)
+                except ValueError:
+                    pass
 
-            normalized_ip = str(address)
-
-            if normalized_ip in seen:
-                continue
-
-            seen.add(normalized_ip)
-
-            if address.is_private:
-                classification = "PRIVATE"
-
-            elif address.is_loopback:
-                classification = "LOOPBACK"
-
-            elif address.is_reserved:
-                classification = "RESERVED"
-
-            elif address.is_link_local:
-                classification = "LINK_LOCAL"
-
-            elif address.is_unspecified:
-                classification = "UNSPECIFIED"
-
-            else:
-                classification = "PUBLIC"
-
+            normalized_ip = policy["normalized_ip"]
+            classification = policy["classification"]
             candidates.append({
                 "ip": normalized_ip,
-                "version": address.version,
+                "raw_ip": raw_ip,
+                "normalized_ip": normalized_ip,
+                "provider_ip": policy["provider_ip"],
+                "version": address.version if address else None,
+                "valid": bool(address and policy["valid"]),
                 "classification": classification,
-                "is_public": (
-                    classification == "PUBLIC"
-                ),
+                "is_public": policy["enrichment_status"] == "ELIGIBLE",
+                "enrichment_status": policy["enrichment_status"],
                 "header_index": header_index,
+                "source_offset": match.start(1),
                 "source_header": header
             })
 
@@ -102,8 +88,8 @@ def extract_public_ips(
         received_headers
     )
 
-    return [
-        item["ip"]
+    return list(dict.fromkeys(
+        item["provider_ip"]
         for item in candidates
-        if item["is_public"]
-    ]
+        if item["is_public"] and item.get("provider_ip")
+    ))

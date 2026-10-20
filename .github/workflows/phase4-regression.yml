@@ -1,0 +1,27 @@
+name: Phase 4 offline regression gate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  phase4-offline-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+      - name: Run Phase 4 offline regression gate
+        working-directory: backend
+        env:
+          PYTHONUTF8: "1"
+        run: python scripts/run_phase4_offline.py

@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "corpus_id": "mailtrace-phase4-supplemental-parser-v1",
+  "purpose": "Additional synthetic parser/normalization robustness cases; not a detection-accuracy benchmark.",
+  "network_policy": "All URLs use example.invalid; tests must be offline.",
+  "fixtures": [
+    {
+      "id": "MT-SUP-0001",
+      "file": "MT-SUP-0001_display-name-impersonation.eml",
+      "sha256": "54ac308d6df78c5c71b07296eeb1db01c012c35cbe75e75d4095eb094ab69c4a",
+      "scenario": "display-name-impersonation",
+      "provenance": "Authored synthetic parser robustness fixture; fictional .invalid domains only.",
+      "human_review_status": "not_performed"
+    },
+    {
+      "id": "MT-SUP-0002",
+      "file": "MT-SUP-0002_reply-to-domain-mismatch.eml",
+      "sha256": "3ff16ecd9cefe2f4ce2f247c112f716660b314c5ea0fa371ce0918a8a36bcd8e",
+      "scenario": "reply-to-domain-mismatch",
+      "provenance": "Authored synthetic parser robustness fixture; fictional .invalid domains only.",
+      "human_review_status": "not_performed"
+    },
+    {
+      "id": "MT-SUP-0003",
+      "file": "MT-SUP-0003_inert-link-request.eml",
+      "sha256": "43554a413856f654eb432d06afd128b92e117fcdd657186212aa19905ac303e6",
+      "scenario": "inert-link-request",
+      "provenance": "Authored synthetic parser robustness fixture; fictional .invalid domains only.",
+      "human_review_status": "not_performed"
+    },
+    {
+      "id": "MT-SUP-0004",
+      "file": "MT-SUP-0004_html-link-anchor.eml",
+      "sha256": "559e2830dec4cd072ab4366c04989a878fd0818161016bbd244a65be46dac179",
+      "scenario": "html-link-anchor",
+      "provenance": "Authored synthetic parser robustness fixture; fictional .invalid domains only.",
+      "human_review_status": "not_performed"
+    },
+    {
+      "id": "MT-SUP-0005",
+      "file": "MT-SUP-0005_auth-results-untrusted-claim.eml",
+      "sha256": "0ed55a4cc3fa1b1da2cb916db99de0bf43908bb000da6b9aa9e4bc2cff3999c7",
+      "scenario": "auth-results-untrusted-claim",
+      "provenance": "Authored synthetic parser robustness fixture; fictional .invalid domains only.",
+      "human_review_status": "not_performed"
+    },
+    {
+      "id": "MT-SUP-0006",
+      "file": "MT-SUP-0006_urgent-payment-language.eml",
+      "sha256": "2a20641d55a7703c03d9b63e6fad7462a3d3b167722c6a287c7af3180997b0db",
+      "scenario": "urgent-payment-language",
+      "provenance": "Authored synthetic parser robustness fixture; fictional .invalid domains only.",
+      "human_review_status": "not_performed"
+    },
+    {
+      "id": "MT-SUP-0007",
+      "file": "MT-SUP-0007_multiline-and-unicode.eml",
+      "sha256": "b9ad0434d722e23f5a68723103b666002772385d07a902c7cb7069b9d8b850f8",
+      "scenario": "multiline-and-unicode",
+      "provenance": "Authored synthetic parser robustness fixture; fictional .invalid domains only.",
+      "human_review_status": "not_performed"
+    },
+    {
+      "id": "MT-SUP-0008",
+      "file": "MT-SUP-0008_multipart-alternative.eml",
+      "sha256": "592543cf35b9b3110a46dc1eacf06e3ae8795a436b7fa5c6928f98d5f1b109dd",
+      "scenario": "multipart-alternative",
+      "provenance": "Authored synthetic parser robustness fixture; fictional .invalid domains only.",
+      "human_review_status": "not_performed"
+    }
+  ]
+}

@@ -1,0 +1,211 @@
+{
+  "schema_version": "1.0",
+  "manifest_id": "mailtrace-dataset-inventory-v1",
+  "inventory_date": "2026-10-19",
+  "scope": "Active MailTrace-AI repository data, model and fixture workflow; no sample message bodies are stored in this manifest.",
+  "policy": {
+    "raw_inputs_immutable": true,
+    "network_downloads_performed_for_this_inventory": false,
+    "external_submission_of_email_content": false,
+    "training_validated": false,
+    "training_allowed_before_label_and_license_review": false,
+    "sample_text_in_manifest": false
+  },
+  "assets": [
+    {
+      "asset_id": "meajor-binary-training-v1",
+      "role": "current_email_ai_model_training_source",
+      "paths": [
+        "backend/data/email_ai/raw/meajor_full.csv",
+        "backend/data/email_ai/normalized/meajor_phishing_binary.jsonl",
+        "backend/data/email_ai/metadata/",
+        "backend/tests/fixtures/meajor_source_group_split.v1.json"
+      ],
+      "format": ["CSV", "JSONL", "JSON metadata"],
+      "local_size_bytes": {
+        "raw_csv": 191121228,
+        "normalized_jsonl": 258888367
+      },
+      "provenance": {
+        "name": "MeAJOR: Merged email Assets from Joint Open-source Repositories",
+        "publisher": "Zenodo",
+        "record": "18471483",
+        "doi": "10.5281/zenodo.18471483",
+        "url": "https://zenodo.org/records/18471483",
+        "local_raw_md5_matches_record": true,
+        "local_raw_md5": "aa8f59e96787cbd696c0b650e5400dc9",
+        "record_describes_sources": ["TREC-05", "TREC-06", "TREC-07", "Nazario Phishing Corpus", "Nigerian Fraud"]
+      },
+      "license_status": "UNRESOLVED: the reviewed Zenodo record does not declare a license in its Rights metadata; component-source terms have not been reconciled. Do not redistribute or use commercially until reviewed.",
+      "privacy_status": "The record describes entity-removal anonymization. Treat as derived sensitive email data until a project privacy scan and retention decision are recorded.",
+      "label_schema": "binary: LEGITIMATE / PHISHING; source-provided labels, not project-adjudicated threat taxonomy labels",
+      "quality": {
+        "source_rows": 108685,
+        "normalized_rows": 106290,
+        "class_counts": {"LEGITIMATE": 58362, "PHISHING": 47928},
+        "class_percent": {"LEGITIMATE": 54.91, "PHISHING": 45.09},
+        "removed_exact_duplicate_rows_reported": 2394,
+        "invalid_label_rows_skipped": 1,
+        "remaining_normalized_text_duplicate_groups": 28,
+        "remaining_duplicate_rows": 31,
+        "remaining_conflicting_label_duplicate_groups": 0,
+        "cross_source_normalized_text_duplicate_groups": 0,
+        "sources_present": {"trec5": 47365, "trec6": 14978, "trec7": 43947},
+        "source_grouped_split_manifest": "backend/tests/fixtures/meajor_source_group_split.v1.json",
+        "campaign_group_leakage_audit": "NOT_PERFORMED"
+      },
+      "repository_state": "Data files are local and Git-ignored; the sample payload is not part of the tracked repository."
+    },
+    {
+      "asset_id": "meajor-source-group-split-v1",
+      "role": "metadata_only_leakage_resistant_evaluation_split_specification",
+      "paths": ["backend/scripts/audit_meajor_source_split.py", "backend/tests/fixtures/meajor_source_group_split.v1.json"],
+      "format": ["Python script", "JSON"],
+      "dataset_rows": 106290,
+      "dataset_sha256": "c0fe5fef82ab284b74e19078b54dc4820de49ef29e7576731abff3c8ecaf3ac5",
+      "strategy": "Three-fold leave-one-source-out; TREC-05, TREC-06, and TREC-07 each form one complete holdout group.",
+      "cross_source_exact_normalized_text_duplicate_groups": 0,
+      "campaign_or_near_duplicate_audit": "NOT_PERFORMED",
+      "contains_email_content_or_per_message_ids": false,
+      "training_performed_for_this_split": false
+    },
+    {
+      "asset_id": "phishing-specific-provisional-corpus-v1",
+      "role": "offline_policy_development_and_provisional_evaluation",
+      "paths": ["backend/data/phishing_specific_corpus/raw/", "backend/data/phishing_specific_corpus/prepared/"],
+      "format": ["EML", "MBOX", "JSONL", "JSON", "CSV", "SHA-256 sidecar"],
+      "local_inventory": {
+        "raw_files": 2982,
+        "raw_bytes": 42346327,
+        "prepared_rows": {"train": 2225, "dev": 556, "holdout": 200},
+        "aggregate_labels": {"ham": 2500, "phishing": 481},
+        "independent_review": "NONE; all prepared rows are marked not_human_reviewed",
+        "exact_sha256_overlap_between_splits": 0
+      },
+      "source_components": [
+        {
+          "name": "Nazario phishing corpus 2025",
+          "source_url": "https://monkey.org/~jose/phishing/phishing-2025",
+          "license": "CC BY 4.0 as recorded in the corpus README/license; attribution and modification notice required when sharing derivatives",
+          "local_sample_count": 481,
+          "privacy": "Public phishing email content; may contain operational indicators and personal data. Keep offline; never visit embedded links."
+        },
+        {
+          "name": "CMU Enron Email Dataset, May 2015 archive",
+          "source_url": "https://www.cs.cmu.edu/~enron/",
+          "license": "No corpus-wide license identified in repository records; legal review required before external/commercial reuse",
+          "local_sample_count": 2500,
+          "privacy": "Historical real corporate correspondence. CMU warns users to be sensitive to people represented in the corpus; treat as sensitive."
+        }
+      ],
+      "label_quality": "Source-folder proxy labels; not project-team human review. 'ham' must not be treated as adjudicated benign.",
+      "limitations": ["Class ratio is 2500 ham to 481 phishing (83.86% / 16.14%).", "Only two broad source-derived classes; not BEC, spam, or uncertain adjudication.", "Campaign-level grouping and near-duplicate audit are not recorded.", "Do not redistribute raw messages."]
+    },
+    {
+      "asset_id": "spamassassin-provisional-corpus-v1",
+      "role": "offline_spam_policy_development_and_provisional_evaluation",
+      "paths": ["backend/data/public_email_corpus/raw/", "backend/data/public_email_corpus/prepared/"],
+      "format": ["BZIP2", "EML", "JSONL", "JSON", "SHA-256 sidecar"],
+      "local_inventory": {
+        "raw_files": 3899,
+        "raw_bytes": 21105874,
+        "prepared_rows": {"train": 2958, "dev": 739, "holdout": 200},
+        "aggregate_labels": {"ham": 2500, "spam": 1397},
+        "independent_review": "NONE; all prepared rows are marked not_human_reviewed",
+        "exact_sha256_overlap_between_splits": 0
+      },
+      "provenance": {
+        "source": "Apache SpamAssassin public corpus (easy_ham and spam_2 subsets)",
+        "url": "https://spamassassin.apache.org/old/publiccorpus/readme.html"
+      },
+      "license_status": "No blanket message-content license identified. Source README says copyright remains with original senders; do not redistribute raw messages without review.",
+      "privacy_status": "Full headers are present in the source corpus; some addresses are obfuscated but not all. Treat as sensitive and offline-only.",
+      "label_quality": "Folder labels are provisional corpus labels; not project-team adjudicated. Spam is not equivalent to phishing/fraud.",
+      "limitations": ["Class ratio is 2500 ham to 1397 spam (64.15% / 35.85%).", "The prepared subset omits hard_ham and does not represent contemporary enterprise mail.", "Campaign/thread-level leakage is not assessed."]
+    },
+    {
+      "asset_id": "phase4-step16-synthetic-fixtures-v1",
+      "role": "offline_parser_and_analysis_regression_fixtures",
+      "paths": ["backend/tests/fixtures/phase4_step16/"],
+      "format": ["EML", "JSON manifest", "Markdown README"],
+      "sample_count": 8,
+      "labels": {"benign_legitimate": 2, "phishing": 1, "credential_harvesting": 1, "bec_payment_change": 1, "suspicious_inconclusive": 1, "malformed_email": 1, "authentication_edge_case": 1},
+      "provenance": "Authored synthetic samples; .invalid domains; existing manifest provides per-file SHA-256, rationale, and parser expectations.",
+      "license_status": "Project-authored; no third-party sample license applies.",
+      "privacy_status": "Existing Step 16 documentation states no personal data, credentials, live links, or attachments.",
+      "independent_review": "NOT_PERFORMED",
+      "use_limit": "Small regression corpus only; not a representative training or detection benchmark. Parser/format labels are orthogonal metadata, not threat classes."
+    },
+    {
+      "asset_id": "phase4-supplemental-synthetic-fixtures-v1",
+      "role": "offline_parser_and_normalization_regression_fixtures",
+      "paths": ["backend/tests/fixtures/phase4_supplemental/"],
+      "format": ["EML", "JSON manifest"],
+      "sample_count": 8,
+      "provenance": "Authored synthetic parser/normalization scenarios; .invalid domains; manifest provides per-file SHA-256.",
+      "license_status": "Project-authored.",
+      "privacy_status": "Synthetic; no external samples documented.",
+      "independent_review": "NOT_PERFORMED",
+      "use_limit": "Not a threat-detection accuracy benchmark; labels are scenarios rather than adjudicated class labels."
+    },
+    {
+      "asset_id": "phase4-blind-review-packet-v1",
+      "role": "pending_independent_review_of_synthetic_phase4_fixtures",
+      "paths": ["backend/tests/fixtures/phase4_human_review/"],
+      "format": ["EML", "CSV", "JSON", "Markdown"],
+      "sample_count": 8,
+      "provenance": "Blinded copies of synthetic Step 16 fixtures; packet README records review as PENDING.",
+      "license_status": "Project-authored synthetic material.",
+      "privacy_status": "Synthetic and inert per packet README; maintainer key and label-revealing files must remain restricted.",
+      "review_status": "PENDING; no adjudication evidence found."
+    },
+    {
+      "asset_id": "phase4-holdout-template-v1",
+      "role": "reserved_schema_only_holdout_template",
+      "paths": ["backend/tests/fixtures/phase4_holdout/holdout.jsonl", "backend/tests/fixtures/phase4_holdout/train_dev_holdout_split.json"],
+      "format": ["JSONL", "JSON", "Markdown"],
+      "template_rows": 200,
+      "actual_labeled_samples": 0,
+      "status": "EMPTY_TEMPLATE_ONLY; rows contain null sample fields and pending review status.",
+      "use_limit": "Do not report the template row count as a holdout sample count."
+    },
+    {
+      "asset_id": "unlabeled-local-email-samples-v1",
+      "role": "manual_or_runtime_samples_not_approved_for_training",
+      "paths": ["test_forensics.eml", "backend/test-data/ioc-correlation-test.eml", "backend/test_legitimate.eml", "backend/test_phishing.eml", "backend/production_test_phishing.eml", "backend/thread_*20260909.eml"],
+      "sample_count": 9,
+      "provenance": "Unknown or insufficiently documented; some names imply intent but filenames are not defensible labels.",
+      "license_status": "UNKNOWN",
+      "privacy_status": "Unverified; possible personal identifiers or active indicators. Do not use for training, upload, or external lookup until inspected and sanitized.",
+      "use_limit": "Excluded from labeled corpora and model training."
+    },
+    {
+      "asset_id": "email-ai-model-artifacts-v1",
+      "role": "existing_binary_phishing_classifier_artifacts",
+      "paths": ["backend/models/email_ai/"],
+      "format": ["JOBLIB", "JSON manifests"],
+      "model_artifacts": [
+        {"path": "email_phishing_l3_base.joblib", "bytes": 1178939, "version": "1.0.0"},
+        {"path": "email_phishing_l3_calibrated_bundle.joblib", "bytes": 1179365, "version": "1.1.0 bundle"},
+        {"path": "email_phishing_l3_calibrated.joblib", "bytes": 19578736, "version": "1.1.0"}
+      ],
+      "training_source": "MeAJOR normalized binary dataset; SHA-256 is recorded in model metadata.",
+      "task": "binary phishing detection (LEGITIMATE / PHISHING)",
+      "production_status": "Manifests explicitly say production_ready=false and require organization-specific validation.",
+      "repository_state": "Model binaries are local and Git-ignored; model manifests and metadata are present locally.",
+      "limitations": ["Model does not implement the requested five-class taxonomy.", "Current training code uses seeded stratified random row splits; this does not prevent campaign/source leakage.", "Separate source-holdout evaluations exist but are also marked not production-ready."]
+    }
+  ],
+  "workflow": {
+    "training_entry_points": ["backend/services/email_ai/train.py", "backend/services/email_ai/train_phishing_l3.py", "backend/services/email_ai/train_phishing_l3_stable.py", "backend/services/email_ai/calibrate_phishing_l3.py"],
+    "data_preparation_entry_points": ["backend/data/email_ai/normalize_meajor_full.py", "backend/scripts/prepare_phishing_specific_corpus.py", "backend/scripts/prepare_public_email_corpus.py"],
+    "evaluation_entry_points": ["backend/scripts/evaluate_phishing_policy.py", "backend/scripts/evaluate_public_corpus_policy.py", "backend/scripts/evaluate_phase4_step18.py", "backend/scripts/evaluate_labeled_holdout.py", "backend/services/email_ai/evaluate_phishing_l3_sources.py"],
+    "training_performed_during_step": false
+  },
+  "required_next_actions": [
+    "Obtain legal approval or confirm source-level reuse terms for MeAJOR and Enron-derived content before any commercial training or redistribution.",
+    "Independently adjudicate synthetic and public-source evaluation labels; preserve reviewer provenance.",
+    "Deduplicate by message/body fingerprint and group campaign, thread, and source before creating final evaluation splits.",
+    "Keep the five-class threat taxonomy separate from parser-quality and authentication-edge labels."
+  ]
+}

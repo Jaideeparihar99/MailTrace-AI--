@@ -10,6 +10,8 @@ import joblib
 import numpy as np
 
 from sklearn.linear_model import LogisticRegression
+
+from .training_readiness import load_grouped_training_rows, require_training_approval, split_labeled_rows
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -119,44 +121,6 @@ def load_dataset(path: Path):
         )
 
     return texts, labels
-
-
-def split_indices(labels):
-    from sklearn.model_selection import train_test_split
-
-    indices = np.arange(
-        len(labels),
-        dtype=np.int64,
-    )
-
-    (
-        train_val_indices,
-        test_indices,
-    ) = train_test_split(
-        indices,
-        test_size=0.15,
-        random_state=SEED,
-        stratify=labels,
-    )
-
-    (
-        train_indices,
-        validation_indices,
-    ) = train_test_split(
-        train_val_indices,
-        test_size=0.1764705882,
-        random_state=SEED,
-        stratify=[
-            labels[index]
-            for index in train_val_indices
-        ],
-    )
-
-    return (
-        np.asarray(train_indices),
-        np.asarray(validation_indices),
-        np.asarray(test_indices),
-    )
 
 
 def binary_labels(labels):
@@ -366,7 +330,12 @@ def expected_calibration_error(
 def fit_sigmoid_calibrator(
     validation_labels,
     validation_probabilities,
+    *,
+    dataset_path=None,
+    approval_manifest=None,
 ):
+    # Keep direct calls fail-closed too; main() also checks before any filesystem side effect.
+    require_training_approval(dataset_path or DATASET, approval_manifest)
     """
     Platt-style sigmoid calibration.
 
@@ -578,6 +547,7 @@ def threshold_sweep(
 
 
 def main():
+    approval = require_training_approval(DATASET)
     started = time.time()
 
     MODEL_ROOT.mkdir(
@@ -606,17 +576,18 @@ def main():
 
     print("LOADING_DATASET")
 
-    texts, labels = load_dataset(
-        DATASET
-    )
-
-    (
-        train_indices,
-        validation_indices,
-        test_indices,
-    ) = split_indices(
-        labels
-    )
+    rows = load_grouped_training_rows(DATASET)
+    approval_after_load = require_training_approval(DATASET)
+    if approval_after_load["dataset_sha256"] != approval["dataset_sha256"]:
+        raise RuntimeError("TRAINING_BLOCKED: approved dataset bytes changed during dataset loading.")
+    approval = approval_after_load
+    indexed_rows = [{**row, "_source_index": index} for index, row in enumerate(rows)]
+    split_result = split_labeled_rows(indexed_rows, seed=SEED)
+    texts = [row["text"] for row in indexed_rows]
+    labels = [row["label"] for row in indexed_rows]
+    train_indices = np.asarray([row["_source_index"] for row in split_result["splits"]["train"]], dtype=np.int64)
+    validation_indices = np.asarray([row["_source_index"] for row in split_result["splits"]["dev"]], dtype=np.int64)
+    test_indices = np.asarray([row["_source_index"] for row in split_result["splits"]["test"]], dtype=np.int64)
 
     train_texts = [
         texts[index]
@@ -1011,6 +982,8 @@ def main():
             "sha256": dataset_hash,
             "rows": len(texts),
         },
+        "training_approval": approval,
+        "grouped_split_manifest": split_result["manifest"],
         "split": {
             "train": len(train_texts),
             "validation": len(validation_texts),

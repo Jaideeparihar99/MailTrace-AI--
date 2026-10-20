@@ -1,0 +1,2 @@
+notice,detail
+superseded,This legacy sheet has been cleared because it exposed expected labels. Use blind_packet/review_sheet.csv and send only the blind_packet contents to the independent reviewer.

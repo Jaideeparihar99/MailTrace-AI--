@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "training_approval.schema.v1.json",
+  "title": "MailTrace-AI training approval manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["approved_for_training", "dataset_sha256", "dataset_components", "reviewer", "approval_date", "license_review", "label_review", "privacy_review"],
+  "properties": {
+    "approved_for_training": {"const": true},
+    "dataset_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "dataset_components": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["component_id", "source", "path", "sha256"],
+        "properties": {
+          "component_id": {"type": "string", "minLength": 1},
+          "source": {"type": "string", "minLength": 1},
+          "path": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "reviewer": {"type": "string", "minLength": 1},
+    "approval_date": {"type": "string", "format": "date"},
+    "license_review": {"$ref": "#/$defs/licenseReview"},
+    "label_review": {"$ref": "#/$defs/labelReview"},
+    "privacy_review": {"$ref": "#/$defs/privacyReview"}
+  },
+  "$defs": {
+    "evidence": {
+      "type": "object", "required": ["reviewer", "review_date", "scope", "evidence_path", "evidence_sha256"],
+      "properties": {
+        "reviewer": {"type": "string", "minLength": 1},
+        "review_date": {"type": "string", "format": "date"},
+        "scope": {"type": "string", "minLength": 1},
+        "evidence_path": {"type": "string", "minLength": 1},
+        "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "licenseReview": {"allOf": [{"$ref": "#/$defs/evidence"}, {"type": "object", "required": ["status"], "properties": {"status": {"const": "APPROVED"}}}]},
+    "privacyReview": {"allOf": [{"$ref": "#/$defs/evidence"}, {"type": "object", "required": ["status"], "properties": {"status": {"const": "APPROVED"}}}]},
+    "labelReview": {
+      "allOf": [
+        {"$ref": "#/$defs/evidence"},
+        {"type": "object", "required": ["status", "independent", "reviewed_count", "reconciliation_sha256"], "properties": {
+          "status": {"const": "ADJUDICATED"},
+          "independent": {"const": true},
+          "reviewed_count": {"type": "integer", "minimum": 1},
+          "reconciliation_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }}
+      ]
+    }
+  }
+}

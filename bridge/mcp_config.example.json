@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mailtrace-local": {
+      "command": "C:\\Users\\ritur\\New folder\\mailtrace\\MailTrace-AI\\backend\\venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\ritur\\New folder\\mailtrace\\MailTrace-AI\\bridge\\mcp_server.py"
+      ],
+      "env": {
+        "MAILTRACE_PROJECT_ROOT": "C:\\Users\\ritur\\New folder\\mailtrace\\MailTrace-AI"
+      }
+    }
+  }
+}

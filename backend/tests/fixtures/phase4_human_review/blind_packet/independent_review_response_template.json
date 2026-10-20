@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0",
+  "review_packet_id": "",
+  "reviewer_identity_or_role": "",
+  "reviewer_organization": "",
+  "reviewed_at_utc": "",
+  "independence_attestation": {
+    "independent_of_dataset_author_and_maintainer": null,
+    "did_not_access_maintainer_key_or_original_labels": null,
+    "attested_at_utc": ""
+  },
+  "review_rows": [],
+  "reviewer_notes": "",
+  "signature_or_approved_attestation_reference": ""
+}

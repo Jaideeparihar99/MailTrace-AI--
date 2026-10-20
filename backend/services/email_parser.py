@@ -1,9 +1,10 @@
-﻿from email import policy
-from email.parser import BytesParser
+from email import policy
 from email.message import Message
 import hashlib
 import re
 import time
+from urllib.parse import urlsplit
+from email.utils import parseaddr
 
 from services.attachment_intelligence.clamav_scanner import is_configured as clamav_is_configured
 from services.attachment_intelligence.clamav_scanner import scan_attachment as scan_attachment_with_clamav
@@ -12,7 +13,10 @@ from services.attachment_intelligence.file_type_analysis import (
     analyze_file_type,
 )
 from services.domain_alignment import normalized_host, organizational_domain
-from services.threat_intelligence.ioc_normalizer import URL_PATTERN, normalize_url, url_deduplication_key
+from services.domain_intelligence import analyze_domains
+from services.url_extraction import extract_url_evidence as _extract_url_evidence
+from services.email_forensics.ip_extractor import extract_ip_candidates
+from services.email_parsing import EmailParseLimitError, MAX_EMAIL_BYTES, parse_email_bytes
 
 
 MAX_STATIC_ATTACHMENT_ANALYSES = 50
@@ -51,6 +55,11 @@ from services.link_deception_intelligence import analyze_link_deception_to_dict
 # ==========================================
 
 def parse_email(file_content: bytes, filename: str):
+    if not isinstance(file_content, bytes):
+        raise TypeError("Email source must be bytes.")
+    if len(file_content) > MAX_EMAIL_BYTES:
+        raise EmailParseLimitError("Email file exceeds the 25 MiB parser limit.")
+    source_format = "outlook_msg" if filename.lower().endswith(".msg") else "eml"
     forensics_input = file_content
     if filename.lower().endswith(".msg"):
         try:
@@ -67,17 +76,11 @@ def parse_email(file_content: bytes, filename: str):
         try:
             normalized_message = outlook_message.asEmailMessage()
             forensics_input = normalized_message.as_bytes()
-            message = BytesParser(
-                policy=policy.default
-            ).parsebytes(
-                forensics_input
-            )
+            message, parse_diagnostics = parse_email_bytes(forensics_input)
         finally:
             outlook_message.close()
     else:
-        message = BytesParser(
-            policy=policy.default
-        ).parsebytes(file_content)
+        message, parse_diagnostics = parse_email_bytes(file_content)
 
 
     # --------------------------------------
@@ -86,13 +89,29 @@ def parse_email(file_content: bytes, filename: str):
 
     headers = extract_headers(message)
 
-    body = extract_body(message)
+    parse_issues = []
+    body = extract_body(message, parse_issues)
 
-    html_body = extract_html_body(message)
+    html_body = extract_html_body(message, parse_issues)
     attachments = extract_attachments(message)
 
-    url_evidence = extract_url_evidence(body, html_body)
-    urls = [item["original_url"] for item in url_evidence]
+    url_evidence = extract_url_evidence(body, html_body, message=message, parse_issues=parse_issues)
+    urls = [item["comparison_url"] for item in url_evidence]
+
+    domain_candidates = []
+    sender_address = parseaddr(message.get("From", ""))[1]
+    sender_domain = sender_address.rsplit("@", 1)[-1] if "@" in sender_address else ""
+    if sender_domain and normalized_host(sender_domain):
+        domain_candidates.append(sender_domain)
+    for evidence in url_evidence:
+        url = evidence.get("original_url") or evidence.get("comparison_url") or ""
+        try:
+            host = urlsplit(url).hostname
+        except ValueError:
+            host = None
+        if host and normalized_host(host):
+            domain_candidates.append(host)
+    domain_intelligence = analyze_domains(domain_candidates)
 
     # ======================================
     # URL INTELLIGENCE
@@ -157,7 +176,19 @@ def parse_email(file_content: bytes, filename: str):
 
         "filename": filename,
 
-        "source_format": "outlook_msg" if filename.lower().endswith(".msg") else "eml",
+        "source_format": source_format,
+
+        "source_evidence": {
+            "sha256": hashlib.sha256(file_content).hexdigest(),
+            "byte_length": len(file_content),
+            "original_bytes_changed": False,
+        },
+
+        "parsing": {
+            **parse_diagnostics,
+            "status": "PARTIAL" if parse_diagnostics["status"] == "PARTIAL" or parse_issues else "COMPLETE",
+            "issues": parse_issues,
+        },
 
         "_forensics_input": forensics_input if filename.lower().endswith(".msg") else None,
 
@@ -170,6 +201,8 @@ def parse_email(file_content: bytes, filename: str):
             "from": message.get(
                 "From"
             ),
+
+            "sender": message.get("Sender"),
 
             "to": message.get(
                 "To"
@@ -191,9 +224,9 @@ def parse_email(file_content: bytes, filename: str):
                 "Message-ID"
             ),
 
-            "date": message.get(
-                "Date"
-            )
+            "date": message.get("Date"),
+            "in_reply_to": message.get("In-Reply-To"),
+            "references": message.get("References")
 
         },
 
@@ -201,11 +234,22 @@ def parse_email(file_content: bytes, filename: str):
 
         "received_chain": received_chain,
 
+        "received_chain_context": {
+            "chain_order": "OLDEST_TO_NEWEST",
+            "header_storage_order": "NEWEST_TO_OLDEST",
+            "trust_state": "UNVERIFIED_MESSAGE_HEADERS",
+            "trusted_receiving_boundary_configured": False,
+            "sender_origin_established": False,
+            "attribution_note": "Received headers in an uploaded message are unverified evidence until matched to a trusted receiving boundary. Relay IP location is approximate infrastructure context, not sender identity or physical location.",
+        },
+
         "ip_intelligence": ip_intelligence,
 
         "body": {
 
             "text": body,
+
+            "html": html_body,
 
             "length": len(body)
 
@@ -217,6 +261,7 @@ def parse_email(file_content: bytes, filename: str):
             "unique_count": len(urls),
             "occurrence_count": sum(len(item["source_locations"]) for item in url_evidence),
         },
+        "domain_intelligence": domain_intelligence,
 
         # ==================================
         # URL INTELLIGENCE RESULT
@@ -245,31 +290,20 @@ def parse_email(file_content: bytes, filename: str):
 # ==========================================
 
 def extract_headers(message: Message):
-
+    """Keep compatibility values while exposing every original header occurrence."""
     headers = {}
+    occurrences: dict[str, list[str]] = {}
+    duplicate_headers = []
+    for key, value in message.raw_items():
+        occurrences.setdefault(key.lower(), []).append(str(value))
 
+    for key_lower, values in occurrences.items():
+        headers[key_lower] = values if key_lower == "received" else values[0]
+        if len(values) > 1:
+            duplicate_headers.append({"name": key_lower, "count": len(values), "values": values})
 
-    for key, value in message.items():
-
-        key_lower = key.lower()
-
-
-        if key_lower == "received":
-
-            if "received" not in headers:
-
-                headers["received"] = []
-
-
-            headers["received"].append(
-                value
-            )
-
-        else:
-
-            headers[key_lower] = value
-
-
+    headers["header_occurrences"] = occurrences
+    headers["duplicate_headers"] = duplicate_headers
     return headers
 
 
@@ -277,7 +311,7 @@ def extract_headers(message: Message):
 # BODY EXTRACTION
 # ==========================================
 
-def extract_body(message: Message):
+def extract_body(message: Message, parse_issues: list | None = None):
 
     body_parts = []
 
@@ -288,7 +322,7 @@ def extract_body(message: Message):
 
     if message.is_multipart():
 
-        for part in message.walk():
+        for part_index, part in enumerate(message.walk()):
 
             content_type = (
                 part.get_content_type()
@@ -316,9 +350,9 @@ def extract_body(message: Message):
                             content
                         )
 
-                except Exception:
-
-                    pass
+                except Exception as error:
+                    if parse_issues is not None:
+                        parse_issues.append({"code": "BODY_DECODE_FAILED", "part_index": part_index, "error_type": type(error).__name__})
 
 
     # --------------------------------------
@@ -343,9 +377,9 @@ def extract_body(message: Message):
                         content
                     )
 
-        except Exception:
-
-            pass
+        except Exception as error:
+            if parse_issues is not None:
+                parse_issues.append({"code": "BODY_DECODE_FAILED", "part_index": 0, "error_type": type(error).__name__})
 
 
     return "\n".join(
@@ -362,12 +396,12 @@ MAX_HTML_PART_CHARS = 2 * 1024 * 1024
 MAX_HTML_PARTS = 32
 
 
-def extract_html_body(message: Message):
+def extract_html_body(message: Message, parse_issues: list | None = None):
 
     html_parts = []
     total_chars = 0
 
-    for part in message.walk():
+    for part_index, part in enumerate(message.walk()):
 
         if len(html_parts) >= MAX_HTML_PARTS:
             break
@@ -383,8 +417,9 @@ def extract_html_body(message: Message):
 
             content = part.get_content()
 
-        except Exception:
-
+        except Exception as error:
+            if parse_issues is not None:
+                parse_issues.append({"code": "HTML_BODY_DECODE_FAILED", "part_index": part_index, "error_type": type(error).__name__})
             continue
 
         if not content:
@@ -415,27 +450,49 @@ def extract_html_body(message: Message):
 # URL EXTRACTION
 # ==========================================
 
-def extract_url_evidence(text: str, html_text: str = "") -> list[dict]:
-    """Extract unique URLs from MIME text/HTML while retaining all source offsets."""
-    found: dict[str, dict] = {}
-    for source, content in (("text/plain", text or ""), ("text/html", html_text or "")):
-        for match in URL_PATTERN.finditer(content):
-            original = match.group(0).rstrip(".,;:!?)]}>")
-            normalized = normalize_url(original)
-            key = url_deduplication_key(original)
-            if not normalized or not key:
-                continue
-            record = found.setdefault(key, {
-                "normalized_url": key,
-                "original_url": original,
-                "source_locations": [],
-            })
-            record["source_locations"].append({"part": source, "offset": match.start()})
-    return list(found.values())
+def extract_url_evidence(
+    text: str,
+    html_text: str = "",
+    *,
+    message: Message | None = None,
+    parse_issues: list | None = None,
+) -> list[dict]:
+    """Use shared URL policy, optionally with exact decoded MIME-part provenance."""
+    if message is None:
+        return _extract_url_evidence([(0, text or "")], [(0, html_text or "")])
+
+    plain_parts: list[tuple[int, str]] = []
+    html_parts: list[tuple[int, str]] = []
+    if message.is_multipart():
+        parts = enumerate(message.walk())
+    else:
+        parts = [(0, message)]
+    for part_index, part in parts:
+        content_type = part.get_content_type()
+        if content_type not in {"text/plain", "text/html"} or part.get_content_disposition() == "attachment":
+            continue
+        try:
+            content = part.get_content()
+        except Exception as error:
+            if parse_issues is not None:
+                parse_issues.append({
+                    "code": "URL_SOURCE_DECODE_FAILED",
+                    "part_index": part_index,
+                    "body_type": content_type,
+                    "error_type": type(error).__name__,
+                })
+            continue
+        if not isinstance(content, str):
+            continue
+        if content_type == "text/plain":
+            plain_parts.append((part_index, content))
+        else:
+            html_parts.append((part_index, content))
+    return _extract_url_evidence(plain_parts, html_parts)
 
 
 def extract_urls(text: str, html_text: str = ""):
-    return [item["original_url"] for item in extract_url_evidence(text, html_text)]
+    return [item["comparison_url"] for item in extract_url_evidence(text, html_text)]
 
 
 # ==========================================
@@ -452,7 +509,7 @@ def extract_attachments(message: Message):
     malware_scanner_configured = clamav_is_configured()
 
 
-    for part in message.walk():
+    for part_index, part in enumerate(message.walk()):
 
         filename = part.get_filename()
 
@@ -502,6 +559,7 @@ def extract_attachments(message: Message):
 
             item = {
                 "filename": safe_filename,
+                "mime_part": part_index,
                 "content_type": part.get_content_type(),
                 "size": None if payload_limit_status else len(payload),
                 "sha256": hashlib.sha256(payload).hexdigest() if not payload_limit_status else None,
@@ -716,32 +774,38 @@ def extract_received_chain(message: Message):
 
 
     chain = []
+    validated_candidates = extract_ip_candidates(received_headers)
 
-
-    for index, received in enumerate(
-        received_headers,
-        start=1
-    ):
-
-        ip_addresses = re.findall(
-            r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
-            received
-        )
-
+    # Receiving servers prepend Received fields. Present the chain oldest to
+    # newest and keep the original newest-first index for evidence traceability.
+    for index, received in enumerate(reversed(received_headers)):
+        header_index = len(received_headers) - index - 1
+        header_candidates = [
+            item for item in validated_candidates
+            if item.get("header_index") == header_index
+        ]
+        valid_candidates = [item for item in header_candidates if item.get("valid", True)]
+        malformed_candidates = [item for item in header_candidates if not item.get("valid", True)]
+        unique_candidates = list({
+            item.get("normalized_ip"): item
+            for item in valid_candidates
+            if item.get("normalized_ip")
+        }.values())
+        ip_addresses = [item["normalized_ip"] for item in unique_candidates]
+        has_relay_syntax = bool(re.search(r"\b(?:from|by)\s+", received, re.IGNORECASE))
 
         chain.append({
-
-            "hop": index,
-
+            "hop": index + 1,
             "raw": received,
-
-            "ip_addresses":
-                list(
-                    dict.fromkeys(
-                        ip_addresses
-                    )
-                )
-
+            "header_index": header_index,
+            "header_position_newest_first": header_index + 1,
+            "ip_addresses": ip_addresses,
+            "ip_classifications": [item["classification"] for item in unique_candidates],
+            "ip_candidates": header_candidates,
+            "malformed_ip_candidates": malformed_candidates,
+            "parse_status": "MALFORMED" if malformed_candidates or not has_relay_syntax else ("PARSED" if ip_addresses else "NO_IP_FOUND"),
+            "trust_state": "UNVERIFIED_MESSAGE_HEADER",
+            "trust_basis": "No trusted receiving-boundary configuration was supplied for this analysis.",
         })
 
 

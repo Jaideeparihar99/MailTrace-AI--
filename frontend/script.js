@@ -407,9 +407,41 @@
             const uploadBox = document.getElementById("uploadBox");
             const emailFile = document.getElementById("emailFile");
             const startAnalysis = document.getElementById("startAnalysis");
+            const analysisProgress = document.getElementById("analysisProgress");
+            const analysisProgressFile = document.getElementById("analysisProgressFile");
+
+            function resetUploadState() {
+                if (emailFile) emailFile.value = "";
+                uploadBox?.querySelector(".upload-icon")?.replaceChildren(document.createTextNode("↑"));
+                const title = uploadBox?.querySelector("strong");
+                const size = uploadBox?.querySelector("span");
+                const hint = uploadBox?.querySelector("small");
+                if (title) title.textContent = "Drop your email here";
+                if (size) size.textContent = "or click to browse";
+                if (hint) hint.textContent = "Supported formats: .EML, .MSG";
+                if (analysisProgress) {
+                    analysisProgress.hidden = true;
+                    analysisProgress.setAttribute("aria-busy", "false");
+                }
+                if (analysisProgressFile) analysisProgressFile.textContent = "";
+                startAnalysis?.classList.remove("analysis-running");
+                if (startAnalysis && !startAnalysis.disabled) startAnalysis.textContent = "Start Analysis";
+            }
+
+            function showSelectedEmail(file) {
+                const icon = uploadBox?.querySelector(".upload-icon");
+                const title = uploadBox?.querySelector("strong");
+                const size = uploadBox?.querySelector("span");
+                const hint = uploadBox?.querySelector("small");
+                if (icon) icon.textContent = "✓";
+                if (title) title.textContent = file.name;
+                if (size) size.textContent = `${(file.size / 1024).toFixed(1)} KB`;
+                if (hint) hint.textContent = "READY FOR ANALYSIS";
+            }
 
             function openModal() {
                 if (!modal) return;
+                if (!startAnalysis?.disabled) resetUploadState();
                 modal.classList.add("show");
                 document.body.style.overflow = "hidden";
                 closeModal?.focus();
@@ -501,19 +533,7 @@
 
                 const file = emailFile.files[0];
 
-                uploadBox.innerHTML = `
-                    <div class="upload-icon">✓</div>
-
-                    <strong>${escapeHTML(file.name)}</strong>
-
-                    <span>
-                        ${(file.size / 1024).toFixed(1)} KB
-                    </span>
-
-                    <small>
-                        READY FOR ANALYSIS
-                    </small>
-                `;
+                showSelectedEmail(file);
 
             });
 
@@ -571,19 +591,7 @@
 
                 emailFile.files = files;
 
-                uploadBox.innerHTML = `
-                    <div class="upload-icon">✓</div>
-
-                    <strong>${escapeHTML(file.name)}</strong>
-
-                    <span>
-                        ${(file.size / 1024).toFixed(1)} KB
-                    </span>
-
-                    <small>
-                        READY FOR ANALYSIS
-                    </small>
-                `;
+                showSelectedEmail(file);
 
             });
 
@@ -631,10 +639,17 @@
 
             // Loading state
             startAnalysis.disabled = true;
+            startAnalysis.classList.add("analysis-running");
+
+            if (analysisProgress) {
+                analysisProgress.hidden = false;
+                analysisProgress.setAttribute("aria-busy", "true");
+            }
+            if (analysisProgressFile) analysisProgressFile.textContent = file.name;
 
             startAnalysis.innerHTML = `
                 <span class="loading-dot"></span>
-                Analysing Email...
+                Analysing email…
             `;
 
             try {
@@ -714,6 +729,12 @@
             } finally {
 
                 startAnalysis.disabled = false;
+                startAnalysis.classList.remove("analysis-running");
+
+                if (analysisProgress) {
+                    analysisProgress.hidden = true;
+                    analysisProgress.setAttribute("aria-busy", "false");
+                }
 
                 startAnalysis.innerHTML =
                     "Start Analysis";
@@ -1292,6 +1313,16 @@
 
             const authentication =
                 analysis.authentication || {};
+            const validatedAuthentication =
+                analysis.email_forensics?.authentication_analysis?.validation || {};
+            const canonicalAuthenticationStates =
+                analysis.result_statuses?.authentication || {};
+            const renderAuthenticationState = method => {
+                const canonical = canonicalAuthenticationStates[method] || {};
+                const validated = validatedAuthentication[method] || {};
+                const reported = authentication[method] || "Not reported";
+                return `<div class="auth-item"><span>${method.toUpperCase()}</span><strong class="${getAuthClass(canonical.status)}">${escapeHTML(canonical.status || "UNKNOWN")}</strong><small>Validator: ${escapeHTML(validated.status || "Not run")} · Message header: ${escapeHTML(reported)}</small></div>`;
+            };
 
             const threat =
                 analysis.threat_analysis || {};
@@ -1353,7 +1384,7 @@ const iocResultMessage = threatIntelStatus === "error" || threatIntelStatus === 
     : threatIntelStatus === "coverage_limited"
         ? "Threat intelligence coverage is limited. No match result is not a safe verdict."
         : threatIntelStatus === "no_iocs"
-            ? "No URL, domain, or IP indicators were extracted. This does not establish that the message is safe."
+        ? "No supported URL, domain, IP, email-address or file-hash indicators were extracted. This does not establish that the message is safe."
             : "No matching IOC evidence was returned. This alone does not establish that the message is safe.";
 
             // This renderer is called before the later fusion UI block is
@@ -1760,6 +1791,18 @@ const resultThreadIntelligence = futureObjectify(analysis.email_thread_intellige
 const resultEmailForensics = futureObjectify(analysis.email_forensics);
 const resultEmailAI = futureObjectify(analysis.email_ai);
 const resultThreatIntelV2 = futureObjectify(analysis.threat_intelligence_v2);
+const resultStatusChecks = futureObjectify(analysis.result_statuses);
+const resultStatusRows = [
+    ["Parsing", resultStatusChecks.parsing?.status],
+    ["Authentication", ["spf", "dkim", "dmarc"].map(key => resultStatusChecks.authentication?.[key]?.status || "UNKNOWN").join(" / ")],
+    ["Geolocation", resultStatusChecks.geolocation?.status],
+    ["IP reputation", resultStatusChecks.network_reputation?.status],
+    ["Model", resultStatusChecks.model_inference?.status],
+    ["Threat intel", [resultStatusChecks.threat_intelligence?.status, resultStatusChecks.threat_intelligence?.outcome].filter(Boolean).join(" · ")],
+    ["Risk fusion", resultStatusChecks.risk_fusion?.status],
+    ["Stored report", resultStatusChecks.report_document?.status],
+    ["Score confidence", resultStatusChecks.score?.confidence_status],
+].filter(([, status]) => status);
 const resultCountOf = value => Array.isArray(value)
     ? value.length
     : futureIsObject(value)
@@ -2008,6 +2051,12 @@ const existingResult =
                             <div><strong>${attachments.length}</strong><span>Attachments</span></div>
                             <div><strong>${receivedChain.length}</strong><span>Relay hops</span></div>
                         </div>
+                        ${resultStatusRows.length ? `
+                            <details class="result-check-statuses">
+                                <summary>Analysis coverage <span>Check results are separate from risk score</span></summary>
+                                <ul>${resultStatusRows.map(([label, status]) => `<li><span>${escapeHTML(label)}</span><strong class="state-${escapeHTML(String(status).toLowerCase().replace(/[^a-z]+/g, "-"))}">${escapeHTML(status)}</strong></li>`).join("")}</ul>
+                            </details>
+                        ` : ""}
                         ${resultTopSignals.length ? `
                             <div class="result-top-signals">
                                 <span>TOP REPORTED SIGNALS</span>
@@ -2256,6 +2305,30 @@ const existingResult =
 
                             </div>
 
+                            <div class="mt-ti-summary-item">
+
+                                <div class="mt-ti-summary-value">
+                                    ${Number(iocSummary.hash || 0)}
+                                </div>
+
+                                <div class="mt-ti-summary-label">
+                                    FILE HASHES
+                                </div>
+
+                            </div>
+
+                            <div class="mt-ti-summary-item">
+
+                                <div class="mt-ti-summary-value">
+                                    ${Number(iocSummary.email || 0)}
+                                </div>
+
+                                <div class="mt-ti-summary-label">
+                                    EMAIL ADDRESSES
+                                </div>
+
+                            </div>
+
 
                             <div class="mt-ti-summary-item">
 
@@ -2306,6 +2379,13 @@ const existingResult =
                                                         )}
                                                     </span>
 
+                                                </div>
+
+                                                <div class="mt-ti-ioc-provenance">
+                                                    <span>${Number(item.occurrence_count || 0)} occurrence(s)</span>
+                                                    ${item.ioc_type === "ip" || item.ioc_type === "ip:port" ? `<span>IPv${Number(item.ip_version || 0)} · ${escapeHTML(String(item.ip_scope || "scope unknown"))}</span>` : ""}
+                                                    <span>${escapeHTML((item.original_values || [item.original_value]).filter(Boolean).join(" · "))}</span>
+                                                    <span>${escapeHTML((item.source_locations || []).map(source => [source.source || source.body_type || source.part, source.field, Number.isInteger(source.mime_part) ? `MIME ${source.mime_part}` : ""].filter(Boolean).join(" · ")).join(" | "))}</span>
                                                 </div>
 
                                             </div>
@@ -2476,64 +2556,7 @@ const existingResult =
                         </div>
 
 
-                        <div class="auth-item">
-
-                            <span>
-                                SPF
-                            </span>
-
-                            <strong class="
-                                ${getAuthClass(
-                                    authentication.spf
-                                )}
-                            ">
-
-                                ${authentication.spf ||
-                                "NOT FOUND"}
-
-                            </strong>
-
-                        </div>
-
-
-                        <div class="auth-item">
-
-                            <span>
-                                DKIM
-                            </span>
-
-                            <strong class="
-                                ${getAuthClass(
-                                    authentication.dkim
-                                )}
-                            ">
-
-                                ${authentication.dkim ||
-                                "NOT FOUND"}
-
-                            </strong>
-
-                        </div>
-
-
-                        <div class="auth-item">
-
-                            <span>
-                                DMARC
-                            </span>
-
-                            <strong class="
-                                ${getAuthClass(
-                                    authentication.dmarc
-                                )}
-                            ">
-
-                                ${authentication.dmarc ||
-                                "NOT FOUND"}
-
-                            </strong>
-
-                        </div>
+                        ${["spf", "dkim", "dmarc"].map(renderAuthenticationState).join("")}
 
                     </div>
 
@@ -3245,18 +3268,21 @@ const existingResult =
                             <div class="result-card-title">
                                 MAIL RELAY PATH
                             </div>
+
+                            <p class="relay-attribution-note">
+                                Displayed oldest to newest from the supplied headers. Header entries are unverified unless matched to a trusted receiving boundary; they do not establish the sender’s true origin.
+                            </p>
                             ${
             ipIntelligence.length > 0
             ? `
                 <div class="result-card origin-intelligence-card">
 
                     <div class="result-card-title">
-                        ORIGIN INTELLIGENCE
+                        RELAY NETWORK CONTEXT
                     </div>
 
                     <div class="origin-intelligence-subtitle">
-                        Infrastructure intelligence derived from
-                        observed relay IP addresses.
+                        Provider-reported context for IPs observed in the supplied Received headers. These headers are not trusted origin proof.
                     </div>
 
                     <div class="origin-list">
@@ -3441,6 +3467,25 @@ const existingResult =
 
                                     </div>
 
+                                    <div class="origin-source-note">
+                                        ${(() => {
+                                            const sources = [
+                                                ...(Array.isArray(ip.provider_status) ? ip.provider_status : []),
+                                                ...(ip.geolocation?.provider ? [ip.geolocation] : []),
+                                                ...(ip.network_intelligence?.provider ? [ip.network_intelligence] : [])
+                                            ];
+                                            const sourceText = [...new Set(sources.map(source => {
+                                                const provider = source.provider || "Unknown provider";
+                                                const status = source.status || source.geolocation_state || "UNKNOWN";
+                                                const timestamp = source.lookup_timestamp ? ` · ${source.lookup_timestamp}` : "";
+                                                return `${provider}: ${status}${timestamp}`;
+                                            }))].join("; ");
+                                            return sourceText
+                                                ? `Source and lookup time: ${escapeHTML(sourceText)}`
+                                                : "No network provider result is available; network classification is unknown.";
+                                        })()}
+                                    </div>
+
                                 </div>
 
                             </div>
@@ -3452,10 +3497,7 @@ const existingResult =
 
                     <div class="origin-disclaimer">
 
-                        ⚠ IP geolocation represents network
-                        infrastructure location and does not
-                        establish the exact physical location
-                        or identity of an attacker.
+                        ⚠ IP geolocation estimates network-infrastructure location. It does not establish the sender’s physical location or identity. Proxy-provider signals do not prove VPN/Tor use or intent.
 
                     </div>
 
@@ -3480,6 +3522,10 @@ const existingResult =
 
                                         <div class="relay-details">
 
+                                            <span class="relay-header-meta">
+                                                Header #${Number(hop.header_index ?? 0) + 1} · ${escapeHTML(hop.parse_status || "UNKNOWN")} · ${escapeHTML(hop.trust_state || "UNVERIFIED_MESSAGE_HEADER")}
+                                            </span>
+
                                             ${
                                                 hop.ip_addresses &&
                                                 hop.ip_addresses.length
@@ -3491,10 +3537,12 @@ const existingResult =
                                                     .join(" ")
                                                 : `
                                                     <span>
-                                                        IP not detected
+                                                        ${escapeHTML(hop.parse_status === "MALFORMED" ? "Malformed relay evidence" : "No IP found in this hop")}
                                                     </span>
                                                 `
                                             }
+
+                                            ${Array.isArray(hop.ip_classifications) && hop.ip_classifications.length ? `<span class="relay-header-meta">IP scope: ${escapeHTML(hop.ip_classifications.join(", "))}</span>` : ""}
 
                                         </div>
 
@@ -4755,9 +4803,8 @@ const existingResult =
 
                                 <div class="mt-future-section">
 
-                                    <span class="mt-future-section-title">
-                                        INDEPENDENT INTEGRITY
-                                    </span>
+                                    <span class="mt-future-section-title">INTEGRITY ANCHOR</span>
+                                    <p class="mt-integrity-scope-note">${String(evidenceIntegrityReceipt.trust_level || "").toUpperCase() === "LOCAL_TEST_ONLY" ? "Locally verified commitment only; this does not prove external immutability." : "Verification scope is limited to the provider and trust level shown below."}</p>
 
                                     <div class="mt-future-grid compact">
 
@@ -5935,10 +5982,9 @@ const existingResult =
 
                                             <strong>
 
-                                                ${Number(
-                                                    investigation.threat_score ||
-                                                    0
-                                                )}
+                                                ${investigation.threat_score === null || investigation.threat_score === undefined
+                                                    ? "—"
+                                                    : Number(investigation.threat_score)}
 
                                             </strong>
 
@@ -6879,9 +6925,9 @@ const existingResult =
 
 
                         const score =
-                            Number(
-                                investigation.threat_score || 0
-                            );
+                            investigation.threat_score === null || investigation.threat_score === undefined
+                                ? null
+                                : Number(investigation.threat_score);
 
 
                         let badgeClass =
@@ -6995,7 +7041,7 @@ const existingResult =
                                         }"
                                     >
 
-                                        ${score}
+                                        ${score === null || !Number.isFinite(score) ? "—" : score}
 
                                     </div>
 
@@ -8028,7 +8074,7 @@ const existingResult =
                         <div class="report-meta">
                             <span>FROM: ${escapeHtml(report.sender || "Unknown")}</span>
                             <span class="report-verdict">${escapeHtml(report.threat_verdict || "UNASSESSED")}</span>
-                            <span>RISK: ${escapeHtml(report.threat_score ?? 0)}/100</span>
+                            <span>RISK: ${report.threat_score === null || report.threat_score === undefined ? "Unavailable" : `${escapeHtml(report.threat_score)}/100`}</span>
                             <span>${escapeHtml(report.created_at || "")}</span>
                         </div>
                     </article>
@@ -8287,13 +8333,13 @@ const existingResult =
     if (!canvas || !details) return;
 
     const safeNodes = Array.isArray(nodes) ? nodes : [];
-    const validNodes = safeNodes.filter(node => {
+    const validNodes = safeNodes.map((node, mapNodeIndex) => ({ ...node, _mapNodeIndex: mapNodeIndex })).filter(node => {
         const lat = Number(node.latitude);
         const lng = Number(node.longitude);
         return Number.isFinite(lat) && Number.isFinite(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
     });
 
-    const renderMapNodeDetail = node => {
+    const renderMapNodeDetail = (node, mapNodeIndex) => {
         const location = [node.city, node.region, node.country].filter(Boolean).join(", ");
         const lat = Number(node.latitude);
         const lng = Number(node.longitude);
@@ -8301,7 +8347,7 @@ const existingResult =
             ? `${lat.toFixed(4)}, ${lng.toFixed(4)}`
             : "Coordinates unavailable";
         return `
-            <article class="map-node-detail">
+            <article class="map-node-detail" data-map-node-index="${mapNodeIndex}" tabindex="-1">
                 <div class="map-node-detail-heading"><strong>${escapeHtml(node.ip || "Observed IP")}</strong><span>${escapeHtml(node.country_code || node.type || "RELAY")}</span></div>
                 <span>${escapeHtml(location || "Location unavailable")}</span>
                 <small>${escapeHtml(coordinates)}</small>
@@ -8358,7 +8404,8 @@ const existingResult =
 
     const map = L.map(mapElement, {
         zoomControl: true,
-        attributionControl: true
+        attributionControl: true,
+        maxZoom: 18
     });
 
     window.currentReportLeafletMap = map;
@@ -8410,20 +8457,12 @@ const existingResult =
 
     const markers = [];
 
-    validNodes.forEach((node, index) => {
+    validNodes.forEach(node => {
 
         const lat = Number(node.latitude);
         const lng = Number(node.longitude);
 
         if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
-
-        const locationParts = [
-            node.city,
-            node.region,
-            node.country
-        ].filter(Boolean);
-
-        const location = locationParts.join(", ") || "Unknown location";
 
         const marker = L.circleMarker(
             [lat, lng],
@@ -8432,24 +8471,46 @@ const existingResult =
                 color: "#00d9ff",
                 weight: 2,
                 fillColor: "#062235",
-                fillOpacity: 1
+                fillOpacity: 1,
+                bubblingMouseEvents: false
             }
         ).addTo(map);
 
-        marker.bindPopup(`
-            <div class="map-popup">
-                <strong>${escapeHtml(node.ip || "Observed IP")}</strong>
-                <span>${escapeHtml(location)}</span>
-                <small>
-                    ${lat.toFixed(4)}, ${lng.toFixed(4)}
-                </small>
-                ${
-                    node.isp
-                        ? `<small>${escapeHtml(node.isp)}</small>`
-                        : ""
-                }
-            </div>
-        `);
+        marker.on("click", event => {
+            // Keep marker clicks inside Leaflet. Bubbling into the map canvas can
+            // make the MapLibre WebGL layer repaint blank in some browsers.
+            if (event.originalEvent) {
+                L.DomEvent.preventDefault(event.originalEvent);
+                L.DomEvent.stopPropagation(event.originalEvent);
+            }
+
+            details.querySelectorAll(".map-node-detail").forEach(card => {
+                const selected = Number(card.dataset.mapNodeIndex) === Number(node._mapNodeIndex);
+                card.classList.toggle("is-selected", selected);
+                if (selected) card.setAttribute("aria-current", "location");
+                else card.removeAttribute("aria-current");
+            });
+
+            map.flyTo([lat, lng], map.getMaxZoom(), {
+                animate: true,
+                duration: 0.65
+            });
+
+            // Leaflet and the embedded MapLibre canvas can briefly lose their
+            // paint after a marker interaction (notably inside the responsive
+            // report modal). Re-measure without panning and repaint the basemap.
+            window.requestAnimationFrame(() => {
+                window.requestAnimationFrame(() => {
+                    if (!mapElement.isConnected || window.currentReportLeafletMap !== map) return;
+                    map.invalidateSize({ pan: false });
+                    map.eachLayer(layer => {
+                        if (typeof layer.getMaplibreMap === "function") {
+                            layer.getMaplibreMap().resize();
+                        }
+                    });
+                });
+            });
+        });
 
         markers.push([lat, lng]);
     });
@@ -12074,7 +12135,7 @@ async function loadCases() {
                         <div class="ip-flag">
 
                             <span>
-                                Proxy
+                                Proxy indicator
                             </span>
 
                             <strong>
@@ -12093,7 +12154,7 @@ async function loadCases() {
                         <div class="ip-flag">
 
                             <span>
-                                Hosting
+                                Hosting provider flag
                             </span>
 
                             <strong>
@@ -12109,6 +12170,19 @@ async function loadCases() {
                         </div>
 
                     </div>
+
+                    <p class="ip-provider-note">
+                        ${(() => {
+                            const network = result.network_intelligence || {};
+                            const sources = Array.isArray(result.provider_status)
+                                ? result.provider_status.filter(item => /network|ipapi/i.test(String(item.provider || "")))
+                                : [];
+                            const provider = network.provider || sources[0]?.provider || "No network-classification provider";
+                            const status = network.status || sources[0]?.status || "UNKNOWN";
+                            const timestamp = network.lookup_timestamp || sources[0]?.lookup_timestamp;
+                            return `${escapeHTML(provider)} · ${escapeHTML(status)}${timestamp ? ` · ${escapeHTML(timestamp)}` : ""}. Proxy is a provider-reported indicator; VPN and Tor status remain UNKNOWN unless separately sourced.`;
+                        })()}
+                    </p>
 
                 </div>
 

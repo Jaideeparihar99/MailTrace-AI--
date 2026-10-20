@@ -1,0 +1,2 @@
+# Optional shared cache dependency for multi-worker deployments.
+redis>=5,<7

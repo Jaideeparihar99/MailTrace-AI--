@@ -662,5 +662,3 @@ __all__ = [
     "analyze_attachment",
     "analyze_attachment_to_dict",
 ]
-
-

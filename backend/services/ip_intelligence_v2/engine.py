@@ -1,4 +1,4 @@
-﻿from typing import Any
+from typing import Any
 
 from .models import IPProfile
 from .validators import (
@@ -89,28 +89,24 @@ def _local_result(
     classification: dict,
 ) -> dict:
 
-    is_unspecified = (
-        str(address) in ("0.0.0.0", "::")
-    )
+    is_unspecified = classification["classification"] == "UNSPECIFIED"
 
     if is_unspecified:
-        local_type = "UNSPECIFIED"
-        local_risk = "SPECIAL"
-    elif classification["is_loopback"]:
-        local_type = "LOOPBACK"
-        local_risk = "LOCAL"
-    elif classification["is_private"]:
-        local_type = "PRIVATE"
-        local_risk = "PRIVATE"
-    elif classification["is_documentation"]:
-        local_type = "DOCUMENTATION"
-        local_risk = "TEST"
-    elif classification["is_reserved"]:
-        local_type = "RESERVED"
-        local_risk = "RESERVED"
+        local_type, local_risk = "UNSPECIFIED", "SPECIAL"
+    elif classification["classification"] == "LOOPBACK":
+        local_type, local_risk = "LOOPBACK", "LOCAL"
+    elif classification["classification"] == "PRIVATE":
+        local_type, local_risk = "PRIVATE", "PRIVATE"
+    elif classification["classification"] == "DOCUMENTATION":
+        local_type, local_risk = "DOCUMENTATION", "TEST"
+    elif classification["classification"] == "LINK_LOCAL":
+        local_type, local_risk = "LINK_LOCAL", "SPECIAL"
+    elif classification["classification"] == "MULTICAST":
+        local_type, local_risk = "MULTICAST", "SPECIAL"
+    elif classification["classification"] == "RESERVED":
+        local_type, local_risk = "RESERVED", "RESERVED"
     else:
-        local_type = _address_type(classification)
-        local_risk = "PUBLIC"
+        local_type, local_risk = classification["classification"], "SPECIAL"
 
     profile = IPProfile(
         ip=str(address),
@@ -228,10 +224,27 @@ def _local_result(
     else:
 
         profile.notes.append(
-            "Publicly routable IP address."
+            f"{classification['classification'].replace('_', ' ').title()} address; "
+            "public enrichment was skipped."
         )
 
-    return profile.to_dict()
+    result = profile.to_dict()
+    result.update({
+        "raw_input": str(address),
+        "normalized_ip": str(address),
+        "provider_ip": None,
+        "classification": classification["classification"],
+        "is_global": False,
+        "status": "NOT_APPLICABLE",
+        "enrichment_status": "NOT_PUBLIC",
+        "is_ipv4_mapped": classification.get("is_ipv4_mapped", False),
+        "provider_status": [
+            {"provider": name, "success": False, "status": "NOT_APPLICABLE",
+             "reason": "NOT_PUBLIC: external enrichment skipped by IP policy."}
+            for name in ("reverse_dns", "geolocation", "network_intelligence", "reputation")
+        ],
+    })
+    return result
 
 
 def analyze_ip_v2(ip: str) -> dict:
@@ -246,6 +259,13 @@ def analyze_ip_v2(ip: str) -> dict:
 
         return {
             "ip": ip,
+            "raw_input": ip,
+            "normalized_ip": None,
+            "provider_ip": None,
+            "classification": "INVALID",
+            "is_global": False,
+            "status": "ERROR",
+            "enrichment_status": "INVALID_IP",
             "valid": False,
             "version": None,
             "type": "INVALID",
@@ -256,7 +276,11 @@ def analyze_ip_v2(ip: str) -> dict:
             "risk_engine": "v5",
             "notes": [error],
             "evidence": [],
-            "provider_status": [],
+            "provider_status": [
+                {"provider": name, "success": False, "status": "NOT_APPLICABLE",
+                 "reason": "INVALID_IP: no lookup attempted."}
+                for name in ("reverse_dns", "geolocation", "network_intelligence", "reputation")
+            ],
         }
 
     classification = classify_address(
@@ -267,23 +291,21 @@ def analyze_ip_v2(ip: str) -> dict:
     # SPECIAL ADDRESS FAST PATH
     # ======================================
 
-    if (
-        classification["is_private"]
-        or classification["is_loopback"]
-        or classification["is_documentation"]
-        or classification["is_reserved"]
-        or str(address) in ("0.0.0.0", "::")
-    ):
-
-        return _local_result(
-            address,
-            classification
-        )
+    if classification["enrichment_status"] != "ELIGIBLE":
+        local_result = _local_result(address, classification)
+        local_result.update({
+            "raw_input": ip,
+            "normalized_ip": classification["normalized_ip"],
+            "provider_ip": None,
+            "is_ipv4_mapped": classification.get("is_ipv4_mapped", False),
+        })
+        return local_result
 
     # ======================================
     # PUBLIC IP PROFILE
     # ======================================
 
+    provider_ip = classification["provider_ip"]
     profile = IPProfile(
         ip=str(address),
         valid=True,
@@ -303,36 +325,28 @@ def analyze_ip_v2(ip: str) -> dict:
     provider_results = []
 
     # DNS
-    dns_result = reverse_dns(
-        str(address)
-    )
+    dns_result = reverse_dns(provider_ip)
 
     provider_results.append(
         dns_result
     )
 
     # GEOLOCATION
-    geo_results = get_geolocation(
-        str(address)
-    )
+    geo_results = get_geolocation(provider_ip)
 
     provider_results.extend(
         geo_results
     )
 
     # NETWORK
-    network_result = query_ipapi_network(
-        str(address)
-    )
+    network_result = query_ipapi_network(provider_ip)
 
     provider_results.append(
         network_result
     )
 
     # REPUTATION
-    reputation_results = get_reputation(
-        str(address)
-    )
+    reputation_results = get_reputation(provider_ip)
 
     provider_results.extend(
         reputation_results
@@ -419,11 +433,9 @@ def analyze_ip_v2(ip: str) -> dict:
         network_info
     )
 
-    if network_info.get(
-        "hosting_signal"
-    ):
-
-        profile.is_hosting = True
+    # ASN/organization/hostname text is not enough to classify hosting,
+    # VPN, proxy or Tor. Keep these flags UNKNOWN until a provider explicitly
+    # supports and reports that classification.
 
     # ======================================
     # REPUTATION
@@ -546,14 +558,60 @@ def analyze_ip_v2(ip: str) -> dict:
 
     for result in provider_results:
 
+        provider_data = result.data if isinstance(result.data, dict) else {}
         profile.provider_status.append({
             "provider": result.provider,
+            "source": provider_data.get("source"),
             "success": result.success,
+            "status": provider_data.get("status") or ("AVAILABLE" if result.success else "PROVIDER_ERROR"),
             "latency_ms": result.latency_ms,
             "error": result.error,
+            "ip": provider_data.get("ip"),
+            "lookup_timestamp": provider_data.get("lookup_timestamp"),
+            "cache_status": provider_data.get("cache_status"),
+            "cache_ttl_seconds": provider_data.get("cache_ttl_seconds"),
+            "cache_expires_at": provider_data.get("cache_expires_at"),
+            "precision": provider_data.get("precision"),
+            "confidence": provider_data.get("confidence"),
         })
 
-    return profile.to_dict()
+    result = profile.to_dict()
+    result.update({
+        "raw_input": ip,
+        "normalized_ip": classification["normalized_ip"],
+        "provider_ip": provider_ip,
+        "classification": classification["classification"],
+        "type": ("PUBLIC IPv4-MAPPED IPv6" if classification.get("is_ipv4_mapped") else result.get("type")),
+        "is_global": True,
+        "status": "PASS",
+        "enrichment_status": "ELIGIBLE",
+        "is_ipv4_mapped": classification.get("is_ipv4_mapped", False),
+    })
+    geo_results_for_status = [item for item in geo_results if item.provider in {"ipapi", "ipinfo", "geolocation"}]
+    geo_winner = next((item for item in geo_results_for_status if item.success), geo_results_for_status[-1] if geo_results_for_status else None)
+    geo_data = (geo_winner.data or {}) if geo_winner else {}
+    geo_state = geo_data.get("status") or ("AVAILABLE" if geo_winner and geo_winner.success else "PROVIDER_ERROR")
+    geo_result_status = {
+        "AVAILABLE": "PASS", "NO_DATA": "UNKNOWN", "NOT_PUBLIC": "NOT_APPLICABLE",
+        "NOT_CONFIGURED": "NOT_RUN",
+    }.get(str(geo_state).upper(), "ERROR")
+    result["geolocation_status"] = {
+        "status": geo_result_status,
+        "state": geo_state,
+        "provider": geo_winner.provider if geo_winner else None,
+        "message": {
+            "NO_DATA": "Provider completed the lookup but returned no location data.",
+            "NOT_CONFIGURED": "No approved geolocation provider is configured.",
+            "NOT_PUBLIC": "Public geolocation does not apply to this address.",
+        }.get(str(geo_state).upper()),
+    }
+    result["geolocation"] = {
+        key: geo_data.get(key) for key in (
+            "ip", "provider", "lookup_timestamp", "cache_status", "cache_ttl_seconds",
+            "cache_expires_at", "precision", "confidence"
+        ) if geo_data.get(key) is not None
+    }
+    return result
 
 
 

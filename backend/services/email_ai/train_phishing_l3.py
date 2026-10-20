@@ -23,8 +23,9 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
+
+from .training_readiness import load_grouped_training_rows, require_training_approval, split_labeled_rows
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -130,6 +131,7 @@ def build_uncalibrated_pipeline():
 
 def main():
 
+    approval = require_training_approval(DATASET)
     started = time.time()
 
     MODEL_ROOT.mkdir(
@@ -144,9 +146,23 @@ def main():
 
     print("LOADING_DATASET")
 
-    texts, labels = load_dataset(
-        DATASET
-    )
+    rows = load_grouped_training_rows(DATASET)
+    approval_after_load = require_training_approval(DATASET)
+    if approval_after_load["dataset_sha256"] != approval["dataset_sha256"]:
+        raise RuntimeError("TRAINING_BLOCKED: approved dataset bytes changed during dataset loading.")
+    approval = approval_after_load
+    split_result = split_labeled_rows(rows, seed=RAW_SPLIT_SEED)
+    train_rows = split_result["splits"]["train"]
+    validation_rows = split_result["splits"]["dev"]
+    test_rows = split_result["splits"]["test"]
+    train_texts = [row["text"] for row in train_rows]
+    train_labels = [row["label"] for row in train_rows]
+    validation_texts = [row["text"] for row in validation_rows]
+    validation_labels = [row["label"] for row in validation_rows]
+    test_texts = [row["text"] for row in test_rows]
+    test_labels = [row["label"] for row in test_rows]
+    texts = [row["text"] for row in rows]
+    labels = [row["label"] for row in rows]
 
     print(
         "TOTAL_USABLE_ROWS:",
@@ -160,35 +176,7 @@ def main():
         dict(distribution)
     )
 
-    # --------------------------------------------------------
-    # Final untouched test set = 15%
-    # Remaining 85% split into train/validation
-    # --------------------------------------------------------
-    (
-        train_val_texts,
-        test_texts,
-        train_val_labels,
-        test_labels,
-    ) = train_test_split(
-        texts,
-        labels,
-        test_size=0.15,
-        random_state=RAW_SPLIT_SEED,
-        stratify=labels,
-    )
-
-    (
-        train_texts,
-        validation_texts,
-        train_labels,
-        validation_labels,
-    ) = train_test_split(
-        train_val_texts,
-        train_val_labels,
-        test_size=0.1764705882,
-        random_state=RAW_SPLIT_SEED,
-        stratify=train_val_labels,
-    )
+    # Grouped partitions come from split_labeled_rows; row-level fallback is prohibited.
 
     print(
         "TRAIN_ROWS:",
@@ -541,6 +529,8 @@ def main():
             "usable_rows": len(texts),
             "distribution": dict(distribution),
         },
+        "training_approval": approval,
+        "grouped_split_manifest": split_result["manifest"],
         "split": {
             "train": len(train_texts),
             "validation": len(validation_texts),

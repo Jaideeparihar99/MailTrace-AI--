@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MailTrace AI</title>
+</head>
+<body>
+    <p>Opening MailTrace AI… <a href="frontend/index.html">Continue to the application</a></p>
+    <script>
+        const appUrl = new URL("frontend/index.html", window.location.href);
+        appUrl.search = window.location.search;
+        appUrl.hash = window.location.hash;
+        window.location.replace(appUrl.href);
+    </script>
+</body>
+</html>

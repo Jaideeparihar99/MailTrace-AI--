@@ -1,0 +1,10 @@
+﻿{
+  "schema_version": "1.0",
+  "train": "backend/data/email_ai/train (existing training data; do not copy into holdout)",
+  "dev": "backend/tests/fixtures/phase4_step16 (existing synthetic regression fixtures; not holdout)",
+  "holdout": "backend/tests/fixtures/phase4_holdout/holdout.jsonl",
+  "holdout_actual_sample_count": 0,
+  "holdout_status": "EMPTY_TEMPLATE_ONLY",
+  "independent_review_required": true,
+  "threshold_tuning_on_holdout_forbidden": true
+}

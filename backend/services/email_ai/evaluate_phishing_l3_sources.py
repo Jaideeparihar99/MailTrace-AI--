@@ -27,6 +27,8 @@ from sklearn.metrics import (
 )
 
 from .train_phishing_l3 import DATASET, build_uncalibrated_pipeline
+from .feature_pipeline import _canonical_text, _near_duplicate_pairs
+from .training_readiness import require_training_approval
 
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:
@@ -59,11 +61,44 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+
+def _assert_no_cross_source_duplicate_leakage(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Fail source-holdout evaluation if canonical exact or detected near duplicates cross sources."""
+    canonical_owner: dict[str, str] = {}
+    exact_cross_source = 0
+    for row in rows:
+        canonical = _canonical_text(row)
+        if not canonical:
+            continue
+        source = str(row.get("source") or "").strip().casefold()
+        previous = canonical_owner.get(canonical)
+        if previous is not None and previous != source:
+            exact_cross_source += 1
+        else:
+            canonical_owner[canonical] = source
+    if exact_cross_source:
+        raise ValueError(f"Source-holdout evaluation blocked: {exact_cross_source} canonical exact duplicate(s) cross source families.")
+
+    near_cross_source = 0
+    for left, right in _near_duplicate_pairs(rows):
+        if str(rows[left].get("source") or "").strip().casefold() != str(rows[right].get("source") or "").strip().casefold():
+            near_cross_source += 1
+    if near_cross_source:
+        raise ValueError(f"Source-holdout evaluation blocked: {near_cross_source} detected near-duplicate pair(s) cross source families.")
+    return {"cross_source_exact_duplicates": exact_cross_source, "cross_source_detected_near_duplicate_pairs": near_cross_source}
+
 def evaluate_source_holdouts(
-    rows: list[dict[str, Any]],
-    dataset_sha256: str,
+    dataset_path: str | Path,
     sources: list[str] | None = None,
+    approval_manifest: str | Path | None = None,
 ) -> dict[str, Any]:
+    dataset_path = Path(dataset_path).resolve()
+    approval = require_training_approval(dataset_path, approval_manifest)
+    rows = _load_rows(dataset_path)
+    dataset_sha256 = _sha256(dataset_path)
+    # The file may have changed while it was being parsed; re-check its approval hash.
+    approval = require_training_approval(dataset_path, approval_manifest)
+    leakage_audit = _assert_no_cross_source_duplicate_leakage(rows)
     available_sources = sorted({row["source"] for row in rows})
     selected_sources = sources or available_sources
     unknown_sources = sorted(set(selected_sources) - set(available_sources))
@@ -121,7 +156,9 @@ def evaluate_source_holdouts(
         "evaluation": "leave_one_source_out",
         "model": "email-phishing-l3 uncalibrated pipeline",
         "threshold_selection": "fixed at 0.5; held-out labels were not used to tune threshold",
-        "dataset": {"path": str(DATASET), "sha256": dataset_sha256, "rows": len(rows)},
+        "dataset": {"path": str(dataset_path), "sha256": dataset_sha256, "rows": len(rows)},
+        "training_approval": approval,
+        "cross_source_leakage_audit": leakage_audit,
         "available_sources": available_sources,
         "folds": folds,
         "production_ready": False,
@@ -137,6 +174,7 @@ def evaluate_source_holdouts(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, default=DATASET)
+    parser.add_argument("--approval-manifest", type=Path, help="Dataset-hash-bound rights, independent-label, and privacy approval JSON.")
     parser.add_argument(
         "--source",
         action="append",
@@ -151,8 +189,7 @@ def main() -> None:
     args = parser.parse_args()
 
     started = time.perf_counter()
-    rows = _load_rows(args.dataset)
-    report = evaluate_source_holdouts(rows, _sha256(args.dataset), args.sources)
+    report = evaluate_source_holdouts(args.dataset, args.sources, args.approval_manifest)
     report["runtime_seconds"] = round(time.perf_counter() - started, 2)
     serialized = json.dumps(report, indent=2, sort_keys=True)
     if args.output:

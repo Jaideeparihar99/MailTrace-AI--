@@ -1,0 +1,18 @@
+{
+  "version": "2026-10-19.1",
+  "provenance": "MailTrace curated reference list assembled from commonly impersonated public service domains; this is a detection seed list, not an authoritative ownership registry.",
+  "last_reviewed": "2026-10-19",
+  "maintenance_policy": "Review quarterly and after material brand/domain changes. Require a reviewed code change with source links for each added/removed registrable domain. Do not expand automatically from email traffic or threat feeds.",
+  "brands": {
+    "microsoft": ["microsoft.com", "live.com", "office.com", "office365.com", "microsoftonline.com"],
+    "google": ["google.com", "google.co.uk", "google.de", "gmail.com"],
+    "apple": ["apple.com", "icloud.com"],
+    "paypal": ["paypal.com"],
+    "amazon": ["amazon.com", "amazonaws.com"],
+    "facebook": ["facebook.com", "meta.com"],
+    "instagram": ["instagram.com"],
+    "linkedin": ["linkedin.com"],
+    "netflix": ["netflix.com"],
+    "docusign": ["docusign.com"]
+  }
+}

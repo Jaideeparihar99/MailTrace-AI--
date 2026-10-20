@@ -25,6 +25,9 @@ import unicodedata
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from urllib.parse import unquote, urljoin, urlsplit
+import ipaddress
+from services.domain_alignment import organizational_domain
+from services.brand_registry import get_brand_registry
 
 try:
     from .advanced_url_intelligence import analyze_url_deception
@@ -54,18 +57,7 @@ ZERO_WIDTH_CHARS = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"}
 BIDI_CONTROL_CHARS = {"\u061c", "\u200e", "\u200f", "\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069"}
 
 # Keep this intentionally aligned with the advanced URL analyzer's supported brands.
-KNOWN_BRANDS = {
-    "microsoft": {"microsoft.com", "live.com", "office.com", "office365.com", "microsoftonline.com"},
-    "google": {"google.com", "gmail.com"},
-    "apple": {"apple.com", "icloud.com"},
-    "paypal": {"paypal.com"},
-    "amazon": {"amazon.com", "amazonaws.com"},
-    "facebook": {"facebook.com", "meta.com"},
-    "instagram": {"instagram.com"},
-    "linkedin": {"linkedin.com"},
-    "netflix": {"netflix.com"},
-    "docusign": {"docusign.com"},
-}
+KNOWN_BRANDS, BRAND_REGISTRY_METADATA = get_brand_registry()
 
 CONFUSABLE_MAP = str.maketrans({
     "а": "a", "ɑ": "a", "α": "a", "с": "c", "ϲ": "c", "е": "e", "ε": "e",
@@ -108,10 +100,11 @@ def _hostname(url: str) -> str | None:
 def _registrable_domain(host: str | None) -> str | None:
     if not host:
         return None
-    labels = [p for p in host.casefold().rstrip(".").split(".") if p]
-    if len(labels) < 2:
-        return host.casefold()
-    return ".".join(labels[-2:])
+    host = host.casefold().rstrip(".")
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return organizational_domain(host)
 
 
 def _extract_visible_url(text: str) -> str | None:
@@ -145,7 +138,11 @@ def _is_external(actual_url: str, base_url: str | None) -> bool | None:
     base_host = _hostname(base_url)
     if not base_host:
         return None
-    return _registrable_domain(actual_host) != _registrable_domain(base_host)
+    actual_registrable = _registrable_domain(actual_host)
+    base_registrable = _registrable_domain(base_host)
+    if not actual_registrable or not base_registrable:
+        return None
+    return actual_registrable != base_registrable
 
 
 @dataclass
@@ -651,5 +648,3 @@ __all__ = [
     "analyze_link_deception",
     "analyze_link_deception_to_dict",
 ]
-
-
