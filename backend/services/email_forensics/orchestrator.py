@@ -9,6 +9,7 @@ from .relay_chain import build_relay_chain, summarize_relay_chain
 from .authentication_analyzer import analyze_authentication
 from .timeline_analyzer import analyze_timeline
 from .url_analyzer import analyze_urls
+from services.url_extraction import extract_url_evidence
 from .origin_scoring import (
     score_origin_candidates,
     get_top_origin_candidate,
@@ -135,17 +136,20 @@ def analyze_email_forensics(
     # -----------------------------------------------------
 
     body_text = ""
+    body_html = ""
 
     try:
         body = headers.get("body", {})
         if isinstance(body, dict):
             body_text = body.get("text", "") or ""
+            body_html = body.get("html", "") or ""
         elif isinstance(body, str):
             body_text = body
     except Exception:
         body_text = ""
 
-    url_analysis = analyze_urls(body_text)
+    url_evidence = extract_url_evidence([(0, body_text)], [(0, body_html)])
+    url_analysis = analyze_urls([item["comparison_url"] for item in url_evidence])
 
     # -----------------------------------------------------
     # RESULT
@@ -153,6 +157,7 @@ def analyze_email_forensics(
 
     return {
         "headers": headers,
+        "parsing": headers.get("parsing", {"status": "UNKNOWN"}),
 
         "ip_intelligence": {
             "candidates": ip_candidates,
@@ -164,6 +169,14 @@ def analyze_email_forensics(
 
         "relay_summary": relay_summary,
 
+        "relay_context": {
+            "chain_order": "OLDEST_TO_NEWEST",
+            "trust_state": "UNVERIFIED_MESSAGE_HEADERS",
+            "trusted_receiving_boundary_configured": False,
+            "sender_origin_established": False,
+            "attribution_note": "Received headers are supplied with the analyzed message and are unverified unless matched against a trusted receiving boundary. Relay IP intelligence describes network infrastructure only.",
+        },
+
         "authentication_analysis": authentication_analysis,
 
         "header_anomaly_analysis": header_anomaly_analysis,
@@ -171,6 +184,7 @@ def analyze_email_forensics(
         "timeline_analysis": timeline_analysis,
 
         "url_analysis": url_analysis,
+        "url_evidence": url_evidence,
 
         "origin_scoring": {
             "candidate_count": len(
@@ -182,13 +196,18 @@ def analyze_email_forensics(
 
         "forensics_status": {
             "headers_parsed": True,
+            "header_parse_status": headers.get("parsing", {}).get("status", "UNKNOWN"),
 
             "received_headers_found": len(
                 received_headers
             ),
 
             "ip_candidates_found": len(
-                ip_candidates
+                [item for item in ip_candidates if item.get("valid", True)]
+            ),
+
+            "malformed_ip_candidates_found": len(
+                [item for item in ip_candidates if not item.get("valid", True)]
             ),
 
             "public_ips_found": len(
@@ -204,32 +223,3 @@ def analyze_email_forensics(
             )
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

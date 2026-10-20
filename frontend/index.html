@@ -10,7 +10,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 
-<link rel="stylesheet" href="style.css?v=20261015-header-spacing-fix">
+<link rel="stylesheet" href="style.css?v=20261015-map-marker-zoom-v1">
 
     <!-- Exact reference world-map libraries -->
     <script defer src="https://cdn.jsdelivr.net/npm/d3@7"></script>
@@ -393,6 +393,7 @@
             <div class="mailtrace-clock-date" id="mailtraceClockDate">Loading date...</div>
 
         </div>
+
 
         <button
             type="button"
@@ -1387,6 +1388,22 @@
         </div>
 
 
+        <section class="analysis-progress" id="analysisProgress" aria-live="polite" aria-busy="false" hidden>
+            <div class="analysis-progress-visual" aria-hidden="true">
+                <span class="analysis-progress-orbit analysis-progress-orbit-one"></span>
+                <span class="analysis-progress-orbit analysis-progress-orbit-two"></span>
+                <span class="analysis-progress-core"><i></i></span>
+            </div>
+            <div class="analysis-progress-copy">
+                <span class="analysis-progress-eyebrow"><i></i> ANALYSIS IN PROGRESS</span>
+                <strong id="analysisProgressTitle">Inspecting email evidence</strong>
+                <span id="analysisProgressFile" class="analysis-progress-file"></span>
+                <span class="analysis-progress-detail">Reviewing message structure, sender signals, URLs and attachments.</span>
+                <span class="analysis-progress-track" aria-hidden="true"><i></i></span>
+            </div>
+        </section>
+
+
         <button
             type="button"
             class="primary-btn full-width"
@@ -1402,7 +1419,7 @@
 
 <script>window.MAILTRACE_API_BASE = "http://127.0.0.1:8002";</script>
 <script src="soc-auth.js?v=20261010-sla-workflow"></script>
-<script src="script.js?v=20261015-sla-action-delegation"></script>
+<script src="script.js?v=20261015-map-marker-zoom-v1"></script>
 
 
     <!-- <script src="header-animation.js"></script> -->

@@ -14,8 +14,10 @@ from sklearn.metrics import (
     classification_report,
     f1_score,
 )
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
+
+from .dataset import load_rows, validate_rows
+from .training_readiness import require_training_approval, split_labeled_rows
 
 
 MODEL_TYPE = "tfidf_logistic_regression"
@@ -71,35 +73,28 @@ def train_model(
     rows: list[dict[str, Any]],
     output_dir: str | Path,
     dataset_path: str,
+    approval_manifest: str | Path | None = None,
 ) -> Dict[str, Any]:
 
-    texts = [
-        row["text"]
-        for row in rows
-    ]
-
-    labels = [
-        row["label"].upper()
-        for row in rows
-    ]
-
-    x_train, x_test, y_train, y_test = train_test_split(
-        texts,
-        labels,
-        test_size=0.20,
-        random_state=RANDOM_STATE,
-        stratify=labels,
-    )
+    approval = require_training_approval(dataset_path, approval_manifest)
+    approved_rows = validate_rows(load_rows(dataset_path))["rows"]
+    # Re-check after reading to catch a dataset replacement during the load window.
+    approval = require_training_approval(dataset_path, approval_manifest)
+    if dataset_sha256(approved_rows) != dataset_sha256(rows):
+        raise RuntimeError("TRAINING_BLOCKED: supplied training rows do not match the hash-approved dataset content.")
+    rows = approved_rows
+    split_result = split_labeled_rows(rows, seed=RANDOM_STATE)
+    train_rows = split_result["splits"]["train"]
+    test_rows = split_result["splits"]["test"]
+    x_train = [row["text"] for row in train_rows]
+    y_train = [row["label"].upper() for row in train_rows]
+    x_test = [row["text"] for row in test_rows]
+    y_test = [row["label"].upper() for row in test_rows]
+    labels = [row["label"].upper() for row in rows]
 
     pipeline = build_pipeline()
-    pipeline.fit(
-        x_train,
-        y_train
-    )
-
-    predictions = pipeline.predict(
-        x_test
-    )
+    pipeline.fit(x_train, y_train)
+    predictions = pipeline.predict(x_test)
 
     accuracy = float(
         accuracy_score(
@@ -155,7 +150,10 @@ def train_model(
         "dataset_sha256": dataset_sha256(rows),
         "training_samples": len(rows),
         "train_samples": len(x_train),
+        "dev_samples": len(split_result["splits"]["dev"]),
         "test_samples": len(x_test),
+        "split_manifest": split_result["manifest"],
+        "training_approval": approval,
         "classes": sorted(set(labels)),
         "metrics": {
             "accuracy": accuracy,

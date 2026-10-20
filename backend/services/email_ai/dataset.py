@@ -99,12 +99,13 @@ def validate_rows(
                 f"Row {index} has empty label."
             )
 
-        valid.append(
-            {
-                "text": text,
-                "label": label,
-            }
-        )
+        normalized_row = {"text": text, "label": label}
+        # Preserve only grouping/time metadata; never copy arbitrary post-investigation fields into the training contract.
+        for key in ("source", "source_group", "campaign_id", "campaign", "thread_id", "conversation_id", "duplicate_group_id", "near_duplicate_group_id", "timestamp", "sent_at", "date", "email_date"):
+            value = row.get(key)
+            if value is not None and str(value).strip():
+                normalized_row[key] = value
+        valid.append(normalized_row)
 
         class_counts[label] = (
             class_counts.get(label, 0) + 1

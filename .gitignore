@@ -49,3 +49,67 @@ backend/runtime_test_artifacts/
 backend/test-data/
 backend/test_attachment_files/
 backend/models/**/*.joblib
+
+# Root-level pytest temporary artifacts
+backend/.pytest-tmp/
+
+# Local recovery copies and generated artifacts (keep files locally, do not version)
+*.before-*
+*.pre-*
+*.pre_*
+*-pre-*
+*.bak
+*.disabled
+backend/backups/
+backend/SOC_FUSION_V3_TEMP/
+backend/services/analysis_provenance_backup_before_v1.1_20260908_020443/
+snapshots/
+soc-map-backups/
+mailtrace v 10/
+.mailtrace_bridge/
+backend/_e2e_response.txt
+backend/_schema_discovery_response.json
+backend/response.json
+MailTrace-ChatGPT-Controller-updated.zip
+MailTrace_PowerShell_Bridge_v2.zip
+backend/MailTrace_AI_SOC_Intelligence_Fusion_v3.zip
+frontend.zip
+# Generated/local validation artifacts
+backend/reports/phase4_holdout/
+backend/_patch_eval_trace.py
+
+# Additional test/lint/coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.sqlite-journal
+*.trace
+# Generated/local validation artifacts
+backend/reports/phase4_holdout/
+backend/_patch_eval_trace.py
+backend/_fix_inventory.py
+
+# Additional test/lint/coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.sqlite-journal
+*.trace
+backend/_patch_provider_aliases.py
+backend/_update_final_report.py
+
+# Round 3 phishing-specific corpus
+backend/data/phishing_specific_corpus/
+
+# Phase 4 local-only expected-label mapping; never include it in reviewer packets
+backend/tests/fixtures/phase4_human_review/maintainer_key.json
+backend/tests/fixtures/phase4_human_review/reconciliation_report.json
+
+# Repository-root pytest temporary databases
+.pytest-tmp/

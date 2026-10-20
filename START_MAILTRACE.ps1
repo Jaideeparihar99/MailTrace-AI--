@@ -318,4 +318,3 @@ else {
 
 Write-Host ""
 Read-Host "Press ENTER to close launcher"
-

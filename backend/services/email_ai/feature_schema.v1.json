@@ -1,0 +1,108 @@
+{
+  "schema_version": "1.0.0",
+  "pipeline_version": "1.0.0",
+  "prediction_target": {
+    "field": "label",
+    "definition": "Dataset-curated binary LEGITIMATE vs PHISHING target for compatibility; parser verdicts are not ground truth.",
+    "allowed_example_labels": [
+      "LEGITIMATE",
+      "PHISHING"
+    ],
+    "source": "Approved or explicitly provisional dataset label, separate from the feature object."
+  },
+  "separation": {
+    "raw_evidence": "Existing parse_email result; immutable input and source paths retained.",
+    "normalized_features": "Bounded deterministic transformations with explicit missingness and provenance.",
+    "model_output": "Reserved null field populated only by a trained classifier at inference time.",
+    "final_risk_score": "Reserved null field for downstream policy/risk fusion; never a training feature."
+  },
+  "limits": {
+    "max_text_chars": 200000,
+    "max_subject_chars": 20000,
+    "max_urls": 500
+  },
+  "features": {
+    "text": [
+      "subject_text",
+      "body_text",
+      "text_for_model"
+    ],
+    "numeric": [
+      "subject_char_count",
+      "body_char_count",
+      "body_word_count",
+      "url_count",
+      "url_host_count",
+      "url_invalid_host_count",
+      "url_query_count",
+      "url_at_symbol_count",
+      "url_punycode_host_count",
+      "header_count",
+      "received_hop_count",
+      "attachment_count"
+    ],
+    "categorical": [
+      "subject_available",
+      "body_available",
+      "body_source",
+      "header_block_available",
+      "from_header_present",
+      "reply_to_header_present",
+      "return_path_header_present",
+      "received_chain_available",
+      "message_date_trustworthy_format",
+      "spf_status",
+      "spf_status_available",
+      "dkim_status",
+      "dkim_status_available",
+      "dmarc_status",
+      "dmarc_status_available",
+      "authentication_results_trusted",
+      "parse_status"
+    ],
+    "lexical": [
+      "exclamation_count",
+      "question_count",
+      "uppercase_ratio",
+      "has_urgent_language",
+      "has_credential_language",
+      "has_financial_language",
+      "has_ip_literal_url",
+      "contains_non_ascii",
+      "contains_bidi_or_invisible_controls"
+    ]
+  },
+  "excluded_from_features": [
+    "label/target/expected_label",
+    "analyst verdict",
+    "threat verdict",
+    "risk score",
+    "report summary",
+    "post-investigation enrichment",
+    "model prediction"
+  ],
+  "split_policy": {
+    "group_keys": [
+      "campaign_id",
+      "campaign",
+      "thread_id",
+      "conversation_id",
+      "duplicate_group_id",
+      "near_duplicate_group_id",
+      "normalized_exact_text_fingerprint"
+    ],
+    "source_grouping": "Enabled when at least three distinct source/source_group values exist.",
+    "time_aware": "Used only when every row has a timezone-aware timestamp; otherwise stable seeded hash grouping.",
+    "near_duplicate_grouping": "Canonical exact duplicates are collapsed before candidate generation; local SimHash bands use token-set Jaccard >= 0.80; oversized first-pass buckets are refined with a second independent band, and refined buckets above 250 remain bounded/skipped. Approximate only; semantic variants can be missed.",
+    "learned_transforms": "Fit only on training partition; vectorizer vocabulary is learned inside fit_text_classifier."
+  },
+  "safety": [
+    "No URL fetch",
+    "No attachment execution",
+    "No external API calls",
+    "No original evidence mutation",
+    "No heavyweight dependency added"
+  ],
+  "authentication_evidence_boundary": "SPF/DKIM/DMARC values are parser-reported evidence, not independently verified authentication or proof of sender identity/legitimacy. The trust indicator reflects only an explicit parser Boolean true; no DNS/signature verification is performed by preprocessing.",
+  "training_gate": "Training, calibration, and source-holdout fitting require the versioned training_approval.schema.v1.json contract: exact dataset SHA-256, hashes for every dataset component and evidence file, rights APPROVED, independent label adjudication ADJUDICATED, and privacy/retention APPROVED. No approval is inferred."
+}

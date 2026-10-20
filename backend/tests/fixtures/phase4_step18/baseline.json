@@ -1,0 +1,160 @@
+{
+  "schema_version": "1.1",
+  "baseline_id": "mailtrace-phase4-step20-offline-v4",
+  "corpus_id": "mailtrace-phase4-step16-v1",
+  "fixture_manifest_sha256": "D99AA0AD45D98A62286B1DBCA245930BF375CF45D2568E0E9EBA38391FCB6CE8",
+  "evaluation_policy": {
+    "unit": "email",
+    "positive_labels": [
+      "bec_payment_change",
+      "credential_harvesting",
+      "phishing"
+    ],
+    "negative_labels": [
+      "authentication_edge_case",
+      "benign_legitimate"
+    ],
+    "positive_verdicts": [
+      "CRITICAL",
+      "HIGH RISK"
+    ],
+    "negative_verdicts": [
+      "LOW RISK"
+    ],
+    "inconclusive_labels_excluded_from_binary_metrics": [
+      "suspicious_inconclusive",
+      "malformed_email"
+    ]
+  },
+  "runtime": {
+    "application_version": "0.1.0",
+    "fusion_engine_version": "3.0.0",
+    "policy_version": "soc-fusion-policy-3.0",
+    "post_fusion_disposition_policy_version": "phase4-review-routing-1.1",
+    "model_status": "MODEL_NOT_REQUIRED_FOR_STUBBED_OFFLINE_GATE",
+    "network": "blocked"
+  },
+  "confusion_matrix": {
+    "tp": 3,
+    "fp": 0,
+    "tn": 3,
+    "fn": 0,
+    "binary_n": 6,
+    "excluded_or_inconclusive": 2
+  },
+  "metrics": {
+    "precision": {
+      "numerator": 3,
+      "denominator": 3,
+      "value": 1.0
+    },
+    "recall": {
+      "numerator": 3,
+      "denominator": 3,
+      "value": 1.0
+    },
+    "f1": {
+      "value": 1.0
+    },
+    "false_positive_rate": {
+      "numerator": 0,
+      "denominator": 3,
+      "value": 0.0
+    }
+  },
+  "results": [
+    {
+      "id": "MT-F16-0001",
+      "label": "benign_legitimate",
+      "verdict": "LOW RISK",
+      "score": 0,
+      "confidence": "UNKNOWN",
+      "review_required": false,
+      "review_reasons": [],
+      "analysis_status": "COMPLETE",
+      "parser_status": "COMPLETE"
+    },
+    {
+      "id": "MT-F16-0002",
+      "label": "benign_legitimate",
+      "verdict": "LOW RISK",
+      "score": 0,
+      "confidence": "UNKNOWN",
+      "review_required": false,
+      "review_reasons": [],
+      "analysis_status": "COMPLETE",
+      "parser_status": "COMPLETE"
+    },
+    {
+      "id": "MT-F16-0003",
+      "label": "phishing",
+      "verdict": "HIGH RISK",
+      "score": 82,
+      "confidence": "LOW",
+      "review_required": false,
+      "review_reasons": [],
+      "analysis_status": "COMPLETE",
+      "parser_status": "COMPLETE"
+    },
+    {
+      "id": "MT-F16-0004",
+      "label": "credential_harvesting",
+      "verdict": "HIGH RISK",
+      "score": 85,
+      "confidence": "LOW",
+      "review_required": false,
+      "review_reasons": [],
+      "analysis_status": "COMPLETE",
+      "parser_status": "COMPLETE"
+    },
+    {
+      "id": "MT-F16-0005",
+      "label": "bec_payment_change",
+      "verdict": "HIGH RISK",
+      "score": 85,
+      "confidence": "LOW",
+      "review_required": false,
+      "review_reasons": [],
+      "analysis_status": "COMPLETE",
+      "parser_status": "COMPLETE"
+    },
+    {
+      "id": "MT-F16-0006",
+      "label": "suspicious_inconclusive",
+      "verdict": "REVIEW REQUIRED (SUSPICIOUS IDENTITY MISMATCH)",
+      "score": 0,
+      "confidence": "UNKNOWN",
+      "review_required": true,
+      "review_reasons": [
+        "FROM_REPLY_TO_DOMAIN_ALIGNMENT_UNVERIFIED"
+      ],
+      "analysis_status": "COMPLETE",
+      "parser_status": "COMPLETE"
+    },
+    {
+      "id": "MT-F16-0007",
+      "label": "malformed_email",
+      "verdict": "REVIEW REQUIRED (PARTIAL EMAIL PARSE)",
+      "score": 0,
+      "confidence": "UNKNOWN",
+      "review_required": true,
+      "review_reasons": [
+        "PARTIAL_EMAIL_PARSE"
+      ],
+      "analysis_status": "PARTIAL",
+      "parser_status": "PARTIAL"
+    },
+    {
+      "id": "MT-F16-0008",
+      "label": "authentication_edge_case",
+      "verdict": "LOW RISK",
+      "score": 0,
+      "confidence": "UNKNOWN",
+      "review_required": false,
+      "review_reasons": [],
+      "analysis_status": "COMPLETE",
+      "parser_status": "COMPLETE"
+    }
+  ],
+  "fixture_count": 8
+}

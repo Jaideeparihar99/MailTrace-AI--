@@ -1,4 +1,6 @@
-﻿import ipaddress
+import ipaddress
+
+from services.ip_address_policy import classify_ip
 
 
 DOCUMENTATION_NETWORKS = (
@@ -29,10 +31,21 @@ def is_documentation_ip(address) -> bool:
 
 
 def classify_address(address) -> dict:
+    policy = classify_ip(str(address))
     return {
         "version": address.version,
-        "is_private": address.is_private,
-        "is_loopback": address.is_loopback,
-        "is_reserved": address.is_reserved,
-        "is_documentation": is_documentation_ip(address),
+        "normalized_ip": policy["normalized_ip"],
+        "effective_version": policy["effective_version"],
+        "is_private": policy["is_private"],
+        "is_loopback": policy["is_loopback"],
+        "is_link_local": policy["is_link_local"],
+        "is_multicast": policy["is_multicast"],
+        "is_unspecified": policy["is_unspecified"],
+        "is_reserved": policy["is_reserved"],
+        "is_documentation": policy["is_documentation"],
+        "is_global": policy["is_global"],
+        "classification": policy["classification"],
+        "provider_ip": policy["provider_ip"],
+        "enrichment_status": policy["enrichment_status"],
+        "is_ipv4_mapped": policy.get("is_ipv4_mapped", False),
     }

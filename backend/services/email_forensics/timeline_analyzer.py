@@ -67,10 +67,10 @@ def analyze_timeline(
 
     received_with_dates: list[dict[str, Any]] = []
 
-    for index, header in enumerate(
-        received_headers,
-        start=1
-    ):
+    # Received fields are normally prepended by each receiving server. Keep
+    # the original newest-first position while showing hops chronologically.
+    for index, header in enumerate(reversed(received_headers)):
+        header_index = len(received_headers) - index - 1
 
         timestamp = None
 
@@ -92,7 +92,9 @@ def analyze_timeline(
                 timestamp = parsed
 
         item = {
-            "hop": index,
+            "hop": index + 1,
+            "header_index": header_index,
+            "header_position_newest_first": header_index + 1,
             "raw": header,
             "timestamp": (
                 timestamp.isoformat()
@@ -109,7 +111,8 @@ def analyze_timeline(
 
             timeline.append({
                 "type": "received",
-                "hop": index,
+                "hop": index + 1,
+                "header_index": header_index,
                 "timestamp": timestamp.isoformat(),
                 "source": "Received"
             })
@@ -276,6 +279,9 @@ def analyze_timeline(
         "received_count": len(
             received_headers
         ),
+        "chain_order": "OLDEST_TO_NEWEST",
+        "trust_state": "UNVERIFIED_MESSAGE_HEADERS",
+        "sender_origin_established": False,
         "received_with_dates": received_with_dates,
         "dated_received_count": len(
             dated_received

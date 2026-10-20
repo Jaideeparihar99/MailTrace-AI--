@@ -25,6 +25,7 @@ Safety:
 from __future__ import annotations
 
 import ipaddress
+import idna
 import math
 import re
 import unicodedata
@@ -39,9 +40,11 @@ from urllib.parse import (
     urlsplit,
     urlunsplit,
 )
+from services.domain_alignment import normalized_host, organizational_domain
+from services.brand_registry import get_brand_registry
 
 
-ANALYSIS_VERSION = "1.0.4"
+ANALYSIS_VERSION = "1.0.5"
 STATIC_ONLY = True
 
 MAX_URL_LENGTH = 8192
@@ -79,24 +82,7 @@ LURE_TERMS = {
     "onedrive", "office365", "microsoft365",
 }
 
-KNOWN_BRANDS = {
-    "microsoft": {
-        "microsoft.com",
-        "live.com",
-        "office.com",
-        "office365.com",
-        "microsoftonline.com",
-    },
-    "google": {"google.com", "gmail.com"},
-    "apple": {"apple.com", "icloud.com"},
-    "paypal": {"paypal.com"},
-    "amazon": {"amazon.com", "amazonaws.com"},
-    "facebook": {"facebook.com", "meta.com"},
-    "instagram": {"instagram.com"},
-    "linkedin": {"linkedin.com"},
-    "netflix": {"netflix.com"},
-    "docusign": {"docusign.com"},
-}
+KNOWN_BRANDS, BRAND_REGISTRY_METADATA = get_brand_registry()
 
 CONFUSABLE_MAP = str.maketrans({
     "а": "a", "ɑ": "a", "α": "a",
@@ -201,6 +187,8 @@ class URLAnalysisResult:
 
     lure_tokens: list[str] = field(default_factory=list)
     brand_candidates: list[str] = field(default_factory=list)
+    brand_comparisons: list[dict[str, object]] = field(default_factory=list)
+    brand_registry: dict[str, str] = field(default_factory=dict)
     legitimate_brand_domain: bool = False
     brand_domain_mismatch: bool = False
 
@@ -254,6 +242,8 @@ class URLAnalysisResult:
             "parser_confusion": self.parser_confusion,
             "lure_tokens": self.lure_tokens,
             "brand_candidates": self.brand_candidates,
+            "brand_comparisons": self.brand_comparisons,
+            "brand_registry": self.brand_registry,
             "legitimate_brand_domain": self.legitimate_brand_domain,
             "brand_domain_mismatch": self.brand_domain_mismatch,
             "findings": [item.to_dict() for item in self.findings],
@@ -298,16 +288,24 @@ def _safe_unquote(value: str, rounds: int = 2) -> str:
     return current
 
 
-def _normalize_host(host: str) -> tuple[str, str]:
-    unicode_host = host
+def _normalize_host(host: str) -> tuple[str, str | None]:
+    unicode_host = host.rstrip(".")
     try:
-        ascii_host = host.encode("idna").decode("ascii")
-    except UnicodeError:
-        ascii_host = host.casefold()
-    return unicode_host, ascii_host.casefold().rstrip(".")
+        address = ipaddress.ip_address(unicode_host)
+        return unicode_host, str(address)
+    except ValueError:
+        pass
+    ascii_host = normalized_host(unicode_host)
+    if not ascii_host:
+        return unicode_host, None
+    try:
+        display_host = idna.decode(ascii_host.encode("ascii"), uts46=True)
+    except (idna.IDNAError, UnicodeError):
+        display_host = unicode_host
+    return display_host, ascii_host
 
 
-def _registrable_domain(ascii_host: str) -> str | None:
+def _registrable_domain(ascii_host: str | None) -> str | None:
     if not ascii_host:
         return None
     try:
@@ -316,12 +314,7 @@ def _registrable_domain(ascii_host: str) -> str | None:
     except ValueError:
         pass
 
-    labels = [label for label in ascii_host.split(".") if label]
-    if len(labels) < 2:
-        return ascii_host
-    # Stdlib-only approximation. Exact public-suffix resolution is intentionally
-    # not performed here because it would need an external PSL dataset.
-    return ".".join(labels[-2:])
+    return organizational_domain(ascii_host)
 
 
 def _levenshtein(a: str, b: str, limit: int = 64) -> int:
@@ -437,9 +430,9 @@ def _path_lure_tokens(path: str, query: str) -> list[str]:
 def _brand_candidates(
     host_ascii: str | None,
     userinfo: str = "",
-) -> tuple[list[str], bool, bool]:
+) -> tuple[list[str], bool, bool, list[dict[str, object]]]:
     if not host_ascii and not userinfo:
-        return [], False, False
+        return [], False, False, []
 
     host_value = (host_ascii or "").casefold()
     userinfo_value = (userinfo or "").casefold()
@@ -447,47 +440,73 @@ def _brand_candidates(
     registrable = _registrable_domain(host_value)
 
     if not registrable:
-        return [], False, False
+        return [], False, False, []
 
     candidates: list[str] = []
+    comparisons: list[dict[str, object]] = []
     legitimate = False
     mismatch = False
 
-    skeleton_host = _skeleton(host_ascii)
+    try:
+        unicode_host = idna.decode(host_value.encode("ascii"), uts46=True)
+    except (idna.IDNAError, UnicodeError):
+        unicode_host = host_value
+    skeleton_host = _skeleton(unicode_host)
+    registry, metadata = get_brand_registry()
 
-    for brand, domains in KNOWN_BRANDS.items():
+    for brand, domains in registry.items():
+        approved_registrable = {organizational_domain(item) or item for item in domains}
         brand_hit = (
             brand in host_value
             or brand in skeleton_host
             or brand in _skeleton(userinfo_value)
         )
-
-        if not brand_hit:
-            continue
-
-        candidates.append(brand)
-
-        if registrable in domains:
+        if registrable in approved_registrable:
             legitimate = True
-            continue
-
-        # Brand text appears but registrable destination is unrelated.
-        # Use similarity as supplemental evidence rather than identity proof.
-        for legitimate_domain in domains:
-            legitimate_label = legitimate_domain.split(".")[0]
-            distance = _levenshtein(
-                _skeleton(registrable.split(".")[0]),
-                _skeleton(legitimate_label),
-                limit=8,
-            )
-            if distance <= 2:
-                mismatch = True
-                break
-
-        if registrable not in domains:
+        try:
+            registered_unicode = idna.decode(registrable.encode("ascii"), uts46=True)
+        except (idna.IDNAError, UnicodeError):
+            registered_unicode = registrable
+        registered_label = _skeleton(registered_unicode.split(".")[0])
+        best: dict[str, object] | None = None
+        for approved in sorted(domains):
+            approved_org = organizational_domain(approved) or approved
+            approved_label = _skeleton(approved_org.split(".")[0])
+            distance = _levenshtein(registered_label, approved_label, limit=8)
+            threshold = 1 if len(approved_label) < 8 else 2
+            ratio = 1.0 - distance / max(len(registered_label), len(approved_label), 1)
+            if distance == 0 and registrable not in approved_registrable:
+                candidate = {"brand": brand, "compared_registrable_domain": registrable,
+                             "approved_registrable_domain": approved_org,
+                             "transformation": "unicode_confusable_skeleton", "edit_distance": 0,
+                             "similarity": 1.0, "registry": metadata.get("version", "unknown")}
+                if best is None:
+                    best = candidate
+            elif distance > 0 and distance <= threshold and ratio >= 0.75:
+                candidate = {"brand": brand, "compared_registrable_domain": registrable,
+                             "approved_registrable_domain": approved_org,
+                             "transformation": "edit_distance", "edit_distance": distance,
+                             "similarity": round(ratio, 3), "registry": metadata.get("version", "unknown")}
+                if best is None or float(candidate["similarity"]) > float(best["similarity"]):
+                    best = candidate
+        if brand_hit and registrable not in approved_registrable:
+            best = best or {"brand": brand, "compared_registrable_domain": registrable,
+                            "approved_registrable_domain": sorted(approved_registrable)[0],
+                            "transformation": "brand_text_outside_approved_domain",
+                            "similarity": None, "registry": metadata.get("version", "unknown")}
+        if best is not None:
+            candidates.append(brand)
+            comparisons.append(best)
             mismatch = True
 
-    return list(dict.fromkeys(candidates)), legitimate, mismatch
+        if registrable in approved_registrable:
+            # A registered brand domain and all of its PSL-aware subdomains are legitimate matches.
+            continue
+
+        if brand_hit and registrable not in approved_registrable:
+            mismatch = True
+
+    return list(dict.fromkeys(candidates)), legitimate, mismatch, comparisons
 
 
 def _canonicalize(
@@ -724,8 +743,21 @@ def analyze_url_deception(url: str) -> URLAnalysisResult:
         result.ascii_hostname = ascii_host
         result.registrable_domain = _registrable_domain(ascii_host)
 
-        labels = [x for x in ascii_host.split(".") if x]
-        result.subdomains = labels[:-2] if len(labels) > 2 else []
+        labels = [x for x in (ascii_host or "").split(".") if x]
+        if ascii_host and result.registrable_domain and ascii_host.endswith("." + result.registrable_domain):
+            prefix = ascii_host[: -(len(result.registrable_domain) + 1)]
+            result.subdomains = [label for label in prefix.split(".") if label]
+        elif ascii_host == result.registrable_domain:
+            result.subdomains = []
+        else:
+            result.subdomains = labels[:-2] if len(labels) > 2 else []
+
+        if not ascii_host:
+            result.add_finding(_finding(
+                "URL_INVALID_HOST_ENCODING", "Invalid hostname encoding",
+                "The hostname could not be safely normalized as an IDNA hostname. No similarity conclusion was made.",
+                "INFO", 0.0, 0.5, {"original_hostname": host},
+            ))
 
         if any(label.startswith("xn--") for label in labels):
             result.punycode_detected = True
@@ -743,18 +775,23 @@ def analyze_url_deception(url: str) -> URLAnalysisResult:
         if any(ord(ch) > 127 for ch in unicode_host):
             result.idn_detected = True
 
-        if _host_confusable(host):
+        if _host_confusable(unicode_host):
             result.unicode_confusable = True
+            confusables = [
+                {"character": char, "codepoint": f"U+{ord(char):04X}", "skeleton_character": char.translate(CONFUSABLE_MAP)}
+                for char in unicode_host if char.translate(CONFUSABLE_MAP) != char
+            ]
             result.add_finding(_finding(
                 "URL_UNICODE_CONFUSABLE_HOST",
                 "Unicode/confusable hostname signal",
-                "The hostname changes under Unicode skeleton normalization, indicating potential homoglyph or visual-deception risk.",
-                "HIGH",
-                24.0,
-                0.97,
+                "The hostname contains Unicode characters that change under the local comparison skeleton; this is a review signal, not proof of impersonation.",
+                "MEDIUM",
+                10.0,
+                0.78,
                 {
                     "unicode_hostname": unicode_host,
                     "skeleton": _skeleton(unicode_host),
+                    "confusable_characters": confusables[:24],
                 },
             ))
 
@@ -797,25 +834,29 @@ def analyze_url_deception(url: str) -> URLAnalysisResult:
                 {"representation": numeric_form, "host": host},
             ))
 
-        brands, legitimate, mismatch = _brand_candidates(
+        brands, legitimate, mismatch, comparisons = _brand_candidates(
             ascii_host,
             split.username or "",
         )
         result.brand_candidates = brands
+        result.brand_comparisons = comparisons
+        result.brand_registry = get_brand_registry()[1]
         result.legitimate_brand_domain = legitimate
         result.brand_domain_mismatch = mismatch
 
         if mismatch and brands and not legitimate:
             result.add_finding(_finding(
                 "URL_BRAND_DOMAIN_MISMATCH",
-                "Brand identity conflicts with destination domain",
-                "A recognizable brand appears in the destination identity while the registrable domain is not an approved brand domain.",
-                "HIGH",
-                25.0,
-                0.95,
+                "Possible brand lookalike domain",
+                "A brand-related hostname pattern or close registrable-domain spelling is not in the approved brand-domain list. This weak similarity signal requires corroboration.",
+                "LOW",
+                8.0,
+                0.72,
                 {
                     "brands": brands,
                     "registrable_domain": result.registrable_domain,
+                    "comparisons": comparisons,
+                    "registry": result.brand_registry,
                 },
             ))
 

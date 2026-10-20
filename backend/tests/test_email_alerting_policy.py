@@ -56,6 +56,16 @@ class EmailAlertingPolicyTests(unittest.TestCase):
         self.assertEqual(result["delivery_action"], "REVIEW")
         self.assertFalse(should_create_alert(result))
 
+    def test_identity_mismatch_review_verdict_cannot_be_allowed(self):
+        result = self.decision({
+            "score": 0,
+            "verdict": "REVIEW REQUIRED (SUSPICIOUS IDENTITY MISMATCH)",
+            "confidence": "UNKNOWN",
+            "review_required": True,
+        }, mode="enforce")
+        self.assertEqual(result["recommended_action"], "REVIEW")
+        self.assertEqual(result["delivery_action"], "REVIEW")
+
     def test_malformed_score_fails_to_review_instead_of_allow(self):
         result = self.decision({"score": "not-a-score", "verdict": "UNKNOWN", "confidence": "UNKNOWN"})
         self.assertEqual(result["recommended_action"], "REVIEW")

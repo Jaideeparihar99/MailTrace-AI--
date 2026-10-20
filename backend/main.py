@@ -1,7 +1,5 @@
 ﻿from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from email import policy
-from email.parser import BytesParser
 from email.utils import getaddresses
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -17,8 +15,10 @@ from services.access_control import (
 )
 
 from services.email_parser import parse_email
+from services.email_parsing import EmailParseLimitError, MAX_EMAIL_BYTES
 from services.attachment_intelligence.clamav_scanner import health_status as clamav_health_status
 from services.ip_intelligence import analyze_ip, analyze_ips
+from services.result_states import build_analysis_statuses
 
 from database.database import (
     initialize_database,
@@ -85,6 +85,7 @@ from database.database import (
 from database.database import get_connection, renew_email_webhook_event_lease
 
 from services.threat_intelligence_v2.engine import analyze_threat_intelligence_v2
+from services.threat_intelligence.providers import enrich_iocs_with_live_providers
 from services.threat_intelligence.sync_service import (
     configured_provider_count,
     sync_threat_intelligence_feeds,
@@ -92,6 +93,7 @@ from services.threat_intelligence.sync_service import (
 from services.campaign_correlation import correlate_campaigns
 from services.email_ai.engine import analyze_email_ai
 from services.email_ai.intelligence_fusion import ENGINE_VERSION as FUSION_ENGINE_VERSION, analyze_email_intelligence
+from services.domain_alignment import compare_domains, normalized_host
 from services.response_management import manage_response
 from copy import deepcopy
 from services.ioc_timeline import build_ioc_timeline
@@ -1149,12 +1151,17 @@ def get_report_map_view(investigation_id: str, request: Request):
             raise HTTPException(status_code=404, detail="Investigation not found.")
 
         analysis = investigation.get("analysis", {})
+        analysis_document_status = "PASS" if isinstance(analysis, dict) and analysis else "UNKNOWN"
         if not analysis:
             raw = investigation.get("analysis_json", "{}")
             try:
                 analysis = json.loads(raw) if isinstance(raw, str) else (raw or {})
             except Exception:
                 analysis = {}
+                analysis_document_status = "ERROR"
+            if not isinstance(analysis, dict):
+                analysis = {}
+                analysis_document_status = "ERROR"
 
         nodes = []
         seen = set()
@@ -1194,6 +1201,14 @@ def get_report_map_view(investigation_id: str, request: Request):
 
         return {
             "success": True,
+            "status": "ERROR" if analysis_document_status == "ERROR" else "PASS" if nodes else "UNKNOWN",
+            "message": (
+                "Stored analysis could not be read."
+                if analysis_document_status == "ERROR"
+                else "No geolocation coordinates are available in this stored analysis."
+                if not nodes
+                else None
+            ),
             "investigation_id": investigation_id,
             "node_count": len(nodes),
             "nodes": nodes,
@@ -1202,8 +1217,8 @@ def get_report_map_view(investigation_id: str, request: Request):
         }
     except HTTPException:
         raise
-    except Exception as error:
-        raise HTTPException(status_code=500, detail=f"Failed to build report map view: {str(error)}")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to build report map view.")
 
 
 # =========================================================
@@ -1604,12 +1619,6 @@ async def create_response_plan(
         )
 
 
-@app.post("/api/response-management/transition")
-
-@app.post("/api/response-management/verification")
-
-
-
 @app.post("/api/recommendations/build")
 async def build_recommendations_api(payload: dict):
     if not isinstance(payload, dict):
@@ -1747,6 +1756,7 @@ async def threat_hunting_hunt(
             ),
         )
 
+@app.post("/api/response-management/verification")
 async def verify_response_plan(
     payload: dict,
 ):
@@ -1826,8 +1836,10 @@ async def verify_response_plan(
             ),
         )
 
+@app.post("/api/response-management/transition")
 async def transition_response_plan(
     payload: dict,
+    request: Request,
 ):
     """
     Apply an analyst-controlled response state transition.
@@ -1854,10 +1866,8 @@ async def transition_response_plan(
         "",
     )
 
-    actor = payload.get(
-        "actor",
-        "ANALYST",
-    )
+    principal = getattr(getattr(request, "state", None), "principal", None)
+    actor = getattr(principal, "subject_id", None) or "ANALYST"
 
     reason = payload.get(
         "reason",
@@ -1939,6 +1949,7 @@ async def analyze_thread_endpoint(
     """
 
     MAX_THREAD_MESSAGES = 100
+    total_thread_bytes = 0
 
     if not files:
         raise HTTPException(
@@ -1979,7 +1990,14 @@ async def analyze_thread_endpoint(
             )
 
         try:
-            raw_bytes = await file.read()
+            raw_bytes = await file.read(MAX_EMAIL_BYTES + 1)
+
+            if len(raw_bytes) > MAX_EMAIL_BYTES:
+                raise HTTPException(status_code=413, detail="An email exceeds the 25 MiB parser limit.")
+
+            total_thread_bytes += len(raw_bytes)
+            if total_thread_bytes > MAX_EMAIL_BYTES:
+                raise HTTPException(status_code=413, detail="Combined thread messages exceed the 25 MiB analysis limit.")
 
             if not raw_bytes:
                 raise HTTPException(
@@ -1988,10 +2006,6 @@ async def analyze_thread_endpoint(
                         f"Thread message '{filename}' is empty."
                     ),
                 )
-
-            message = BytesParser(
-                policy=policy.default
-            ).parsebytes(raw_bytes)
 
             parsed = parse_email(
                 raw_bytes,
@@ -2035,15 +2049,9 @@ async def analyze_thread_endpoint(
             )
 
             thread_message = {
-                "message_id": message.get(
-                    "Message-ID"
-                ),
-                "in_reply_to": message.get(
-                    "In-Reply-To"
-                ),
-                "references": message.get(
-                    "References"
-                ),
+                "message_id": basic.get("message_id"),
+                "in_reply_to": basic.get("in_reply_to"),
+                "references": basic.get("references"),
                 "subject": basic.get(
                     "subject"
                 ),
@@ -2051,7 +2059,7 @@ async def analyze_thread_endpoint(
                     "from"
                 ),
                 "sender": basic.get(
-                    "from"
+                    "sender"
                 ),
                 "to": basic.get(
                     "to"
@@ -2073,6 +2081,7 @@ async def analyze_thread_endpoint(
                     "",
                 ),
                 "headers": headers,
+                "parsing": parsed.get("parsing", {"status": "UNKNOWN"}),
                 "source_filename": filename,
             }
 
@@ -2083,14 +2092,13 @@ async def analyze_thread_endpoint(
         except HTTPException:
             raise
 
+        except EmailParseLimitError as parse_error:
+            raise HTTPException(status_code=413, detail=str(parse_error)) from parse_error
+
         except Exception as parse_error:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"Failed to parse thread message "
-                    f"'{filename}': "
-                    f"{parse_error}"
-                ),
+                detail=f"Thread message '{filename}' could not be parsed safely.",
             )
 
     # --------------------------------------------------------
@@ -2675,12 +2683,15 @@ def get_my_employee_report(report_id: str, request: Request):
 
 
 @app.get("/api/alerts")
-def list_security_alerts(limit: int = 100, status: str | None = None):
+def list_security_alerts(request: Request, limit: int = 100, status: str | None = None):
     """Return durable high-risk mail alerts for the analyst notification UI."""
     normalized_status = status.strip().upper() if status else None
     if normalized_status and normalized_status not in {"NEW", "ACKNOWLEDGED", "RESOLVED"}:
         raise HTTPException(status_code=400, detail="Unsupported alert status filter.")
-    alerts = get_email_alerts(limit=limit, status=normalized_status)
+    principal = getattr(request.state, "principal", None)
+    if principal is None or not (set(getattr(principal, "roles", ())) & SOC_ACCESS_ROLES):
+        raise HTTPException(status_code=401 if principal is None else 403, detail="Authentication required." if principal is None else "Insufficient role.")
+    alerts = get_email_alerts(limit=limit, status=normalized_status, tenant_id=principal.tenant_id)
     for alert in alerts:
         try:
             alert["user_notification"] = json.loads(alert.pop("user_notice_json") or "null")
@@ -2693,29 +2704,38 @@ def list_security_alerts(limit: int = 100, status: str | None = None):
 def acknowledge_security_alert(alert_id: str, request: Request):
     """Persist analyst acknowledgement on the server instead of browser storage."""
     principal = getattr(request.state, "principal", None)
-    actor = f"tenant:{principal.tenant_id}" if principal else "local-loopback-analyst"
-    alert = acknowledge_email_alert(alert_id, actor)
+    if principal is None or not (set(getattr(principal, "roles", ())) & SOC_ACCESS_ROLES):
+        raise HTTPException(status_code=401 if principal is None else 403, detail="Authentication required." if principal is None else "Insufficient role.")
+    actor = f"tenant:{principal.tenant_id}"
+    alert = acknowledge_email_alert(alert_id, actor, tenant_id=principal.tenant_id)
     if alert is None:
         raise HTTPException(status_code=404, detail="Security alert not found.")
     return {"success": True, "alert": alert}
 
 
 @app.get("/api/alerts/{alert_id}/history")
-def get_security_alert_history(alert_id: str):
-    events = get_email_alert_history(alert_id)
+def get_security_alert_history(alert_id: str, request: Request):
+    principal = getattr(request.state, "principal", None)
+    if principal is None or not (set(getattr(principal, "roles", ())) & SOC_ACCESS_ROLES):
+        raise HTTPException(status_code=401 if principal is None else 403, detail="Authentication required." if principal is None else "Insufficient role.")
+    events = get_email_alert_history(alert_id, tenant_id=principal.tenant_id)
     if not events:
         raise HTTPException(status_code=404, detail="Security alert history not found.")
     return {"success": True, "alert_id": alert_id, "events": events}
 
 
 @app.get("/api/alerts/{alert_id}/gateway-action-integrity")
-def get_gateway_action_integrity(alert_id: str):
+def get_gateway_action_integrity(alert_id: str, request: Request):
     """Show whether the gateway reported applying the action and verify receipt integrity."""
+    principal = getattr(request.state, "principal", None)
+    if principal is None or not (set(getattr(principal, "roles", ())) & SOC_ACCESS_ROLES):
+        raise HTTPException(status_code=401 if principal is None else 403, detail="Authentication required." if principal is None else "Insufficient role.")
     connection = get_connection()
     try:
         row = connection.execute(
-            "SELECT event_id FROM email_alerts WHERE alert_id=?",
-            (alert_id,),
+            """SELECT a.event_id FROM email_alerts a JOIN investigations i ON i.investigation_id=a.investigation_id
+               WHERE a.alert_id=? AND i.tenant_id=?""",
+            (alert_id, principal.tenant_id),
         ).fetchone()
     finally:
         connection.close()
@@ -2733,8 +2753,10 @@ def get_gateway_action_integrity(alert_id: str):
 @app.post("/api/alerts/{alert_id}/resolve")
 def resolve_security_alert(alert_id: str, request: Request):
     principal = getattr(request.state, "principal", None)
-    actor = f"tenant:{principal.tenant_id}" if principal else "local-loopback-analyst"
-    alert = resolve_email_alert(alert_id, actor)
+    if principal is None or not (set(getattr(principal, "roles", ())) & SOC_ACCESS_ROLES):
+        raise HTTPException(status_code=401 if principal is None else 403, detail="Authentication required." if principal is None else "Insufficient role.")
+    actor = f"tenant:{principal.tenant_id}"
+    alert = resolve_email_alert(alert_id, actor, tenant_id=principal.tenant_id)
     if alert is None:
         raise HTTPException(status_code=404, detail="Security alert not found.")
     return {"success": True, "alert": alert}
@@ -2829,10 +2851,13 @@ async def _analyze_email(
         # PARSE EMAIL
         # -------------------------------------
 
-        result = parse_email(
-            file_content,
-            file.filename,
-        )
+        try:
+            result = parse_email(file_content, file.filename)
+        except EmailParseLimitError as parse_error:
+            api_logger.info("email_parse_resource_limit error_type=%s", type(parse_error).__name__)
+            raise HTTPException(status_code=413, detail="Email exceeds supported parsing resource limits.") from parse_error
+        except Exception as parse_error:
+            raise HTTPException(status_code=422, detail="Email could not be parsed safely.") from parse_error
         forensic_input = result.pop("_forensics_input", None) or file_content
 
 
@@ -2983,6 +3008,7 @@ async def _analyze_email(
             forensic_analysis = enriched_forensics
 
         result["email_forensics"] = forensic_analysis
+        result["ip_intelligence"] = forensic_ip_intelligence
 
         # -------------------------------------
         # CALIBRATED AI EMAIL ANALYSIS
@@ -3084,13 +3110,15 @@ async def _analyze_email(
             )
 
         except Exception as ai_error:
+            api_logger.error("email_model_inference_failed error_type=%s", type(ai_error).__name__)
             ai_result = {
                 "status": "ERROR",
                 "model_ready": False,
                 "classification": "UNKNOWN",
                 "model_probability": 0.0,
                 "calibrated_probability": None,
-                "error": str(ai_error),
+                "error": "Model inference could not be completed.",
+                "error_type": type(ai_error).__name__,
             }
 
         result["email_ai"] = ai_result
@@ -3104,9 +3132,13 @@ async def _analyze_email(
             "ioc_summary": {
                 "total": 0,
                 "ip": 0,
+                "ipv4": 0,
+                "ipv6": 0,
                 "ip:port": 0,
                 "url": 0,
                 "domain": 0,
+                "email": 0,
+                "hash": 0,
             },
             "iocs": [],
             "matches": {},
@@ -3121,9 +3153,44 @@ async def _analyze_email(
                 or ""
             )
 
+            basic_information = result.get("basic_information", {}) or {}
+            header_occurrences = (result.get("headers", {}) or {}).get("header_occurrences", {})
+            additional_ioc_sources = []
+            html_body = (result.get("body", {}) or {}).get("html", "") or ""
+            if html_body:
+                additional_ioc_sources.append({"source": "body.html", "body_type": "text/html", "text": html_body})
+            for header_name, raw_header_name in (
+                ("from", "from"), ("sender", "sender"), ("to", "to"),
+                ("cc", "cc"), ("reply_to", "reply-to"), ("return_path", "return-path"),
+            ):
+                header_values = header_occurrences.get(raw_header_name) or [basic_information.get(header_name)]
+                for occurrence_index, header_value in enumerate(header_values):
+                    if header_value:
+                        additional_ioc_sources.append({
+                            "source": f"header.{header_name}[{occurrence_index + 1}]",
+                            "body_type": "message-header",
+                            "text": str(header_value),
+                            "field": header_name,
+                        })
+            attachment_indicators = [
+                {
+                    "indicator_type": "hash_sha256",
+                    "value": attachment.get("sha256"),
+                    "extraction_method": "attachment_sha256",
+                    "source": "attachment",
+                    "mime_part": attachment.get("mime_part"),
+                    "filename": attachment.get("filename"),
+                    "field": "sha256",
+                }
+                for attachment in result.get("attachments", [])
+                if isinstance(attachment, dict) and attachment.get("sha256")
+            ]
+
             normalized_iocs = extract_iocs(
                 email_body,
                 url_evidence=result.get("url_evidence", []),
+                additional_sources=additional_ioc_sources,
+                extra_indicators=attachment_indicators,
             )
 
             threat_intelligence["ioc_summary"] = (
@@ -3139,6 +3206,30 @@ async def _analyze_email(
             threat_intelligence["iocs"] = (
                 normalized_iocs
             )
+
+            # Live provider lookups are independent of cached-feed matching. A provider
+            # failure is recorded as evidence and must never abort the email analysis.
+            try:
+                threat_intelligence["live_provider_enrichment"] = enrich_iocs_with_live_providers(
+                    normalized_iocs,
+                    max_iocs=30,
+                )
+            except Exception as live_provider_error:
+                api_logger.warning(
+                    "threat_intel_live_enrichment_failed error_type=%s",
+                    type(live_provider_error).__name__,
+                )
+                threat_intelligence["live_provider_enrichment"] = {
+                    "mode": "live_provider_enrichment",
+                    "status": "unavailable",
+                    "provider_results": {},
+                    "evidence_ledger": [{
+                        "evidence_type": "provider_unavailable",
+                        "status": "provider unavailable",
+                        "provider": "orchestrator",
+                        "error_code": "UNHANDLED_EXCEPTION",
+                    }],
+                }
 
             ioc_values = [
                 item.get("ioc")
@@ -3164,8 +3255,10 @@ async def _analyze_email(
                     threat_intelligence["status"] = "no_matches"
 
         except Exception as ioc_error:
+            api_logger.error("ioc_lookup_failed error_type=%s", type(ioc_error).__name__)
             threat_intelligence["status"] = "error"
-            threat_intelligence["error"] = str(ioc_error)
+            threat_intelligence["error"] = "Threat intelligence lookup could not be completed."
+            threat_intelligence["error_type"] = type(ioc_error).__name__
 
         try:
             source_provenance = get_threat_intelligence_source_status()
@@ -3222,7 +3315,8 @@ async def _analyze_email(
 
             result["threat_intelligence_v2"] = {
                 "status": "error",
-                "error": str(v2_error),
+                "error": "Threat intelligence correlation could not be completed.",
+                "error_type": type(v2_error).__name__,
             }
 
         # -------------------------------------
@@ -3315,12 +3409,14 @@ async def _analyze_email(
         result["threat_analysis"]["score_source_reason"] = score_resolution["reason"]
         result["threat_analysis"]["degraded_mode"] = score_resolution["degraded"]
         result["threat_analysis"]["fusion_status"] = score_resolution["fusion_status"]
-        
+
                 # -------------------------------------
         # UPDATE VERDICT / CONFIDENCE
         # -------------------------------------
 
-        if combined_threat_score >= 90:
+        if score_source != "intelligence_fusion" and combined_threat_score == 0:
+            result["threat_analysis"]["verdict"] = "REVIEW REQUIRED (ANALYSIS DEGRADED)"
+        elif combined_threat_score >= 90:
             result["threat_analysis"]["verdict"] = "CRITICAL"
         elif combined_threat_score >= 50:
             result["threat_analysis"]["verdict"] = "HIGH RISK"
@@ -3377,7 +3473,75 @@ async def _analyze_email(
             "supporting_signal_count": fusion_signal_count if fusion_confidence_valid else 0,
             "independent_evidence_count": independent_evidence_count if fusion_confidence_valid else 0,
         })
-  
+
+        if result.get("parsing", {}).get("status") != "COMPLETE":
+            result["analysis_status"] = "PARTIAL"
+            result["threat_analysis"]["verdict"] = "REVIEW REQUIRED (PARTIAL EMAIL PARSE)"
+            result["threat_analysis"]["confidence"] = "UNKNOWN"
+            result["threat_analysis"]["confidence_basis"] = "partial_email_parse"
+            result["threat_analysis"]["review_required"] = True
+            result["threat_analysis"]["review_reasons"] = ["PARTIAL_EMAIL_PARSE"]
+
+        # A model-only threat prediction without independent corroboration is an
+        # analyst-review outcome, even when its numeric score is elevated. Keep
+        # the score and evidence intact, but do not present it as a confirmed
+        # high-risk disposition or silently treat it as safe.
+        fusion_evidence = intelligence_fusion.get("evidence", []) if isinstance(intelligence_fusion, dict) else []
+        fusion_evidence = [item for item in fusion_evidence if isinstance(item, dict)] if isinstance(fusion_evidence, list) else []
+        threat_classes = {"PHISHING", "BEC", "CREDENTIAL_THEFT", "INVOICE_FRAUD",
+                          "PAYMENT_DIVERSION", "EXECUTIVE_IMPERSONATION", "MALWARE_DELIVERY"}
+        model_only_unconfirmed = (
+            result.get("parsing", {}).get("status") == "COMPLETE"
+            and bool(intelligence_fusion.get("model_available"))
+            and str(intelligence_fusion.get("classification", "")).upper() in threat_classes
+            and independent_evidence_count == 0
+            and bool(fusion_evidence)
+            and all(str(item.get("category", "")).lower() == "ml" for item in fusion_evidence)
+        )
+        if model_only_unconfirmed:
+            threat = result["threat_analysis"]
+            threat["verdict"] = "REVIEW REQUIRED (UNCONFIRMED MODEL SIGNAL)"
+            threat["review_required"] = True
+            threat["review_reasons"] = ["MODEL_THREAT_PREDICTION_UNCORROBORATED"]
+            indicators = threat.setdefault("indicators", [])
+            if not any(item.get("type") == "model" and item.get("title") == "Uncorroborated model threat signal"
+                       for item in indicators if isinstance(item, dict)):
+                indicators.append({"type": "model", "severity": "medium",
+                                   "title": "Uncorroborated model threat signal",
+                                   "description": "The model indicates a threat, but independent security evidence is not available; analyst review is required."})
+            threat["indicator_count"] = len(indicators)
+
+        # Identity mismatch is an analyst-review signal, not proof of fraud.
+        # Keep the numeric threat score evidence-based; never silently call this LOW RISK.
+        basic_identity = result.get("basic_information") or {}
+        from_identity = basic_identity.get("from") or ""
+        reply_identity = basic_identity.get("reply_to") or ""
+        identity_alignment = compare_domains(from_identity, reply_identity) if from_identity and reply_identity else "UNKNOWN"
+        from_host = normalized_host(from_identity) if from_identity else None
+        reply_host = normalized_host(reply_identity) if reply_identity else None
+        host_difference = bool(from_host and reply_host and from_host != reply_host)
+        identity_review_needed = identity_alignment == "MISMATCH" or (identity_alignment == "UNKNOWN" and host_difference)
+        if result.get("parsing", {}).get("status") == "COMPLETE" and identity_review_needed:
+            threat = result["threat_analysis"]
+            threat["verdict"] = "REVIEW REQUIRED (SUSPICIOUS IDENTITY MISMATCH)"
+            threat["review_required"] = True
+            reason = ("FROM_REPLY_TO_ORGANIZATIONAL_DOMAIN_MISMATCH" if identity_alignment == "MISMATCH"
+                      else "FROM_REPLY_TO_DOMAIN_ALIGNMENT_UNVERIFIED")
+            threat["review_reasons"] = [reason]
+            indicators = threat.setdefault("indicators", [])
+            if not any(item.get("type") == "identity" and item.get("title") == "From/Reply-To domain alignment concern" for item in indicators if isinstance(item, dict)):
+                indicators.append({"type": "identity", "severity": "medium",
+                                   "title": "From/Reply-To domain alignment concern",
+                                   "description": "The sender and reply destination do not have confirmed organizational alignment; analyst review is required."})
+            threat["indicator_count"] = len(indicators)
+        else:
+            result["threat_analysis"].setdefault("review_required", False)
+            result["threat_analysis"].setdefault("review_reasons", [])
+
+        # A low score is not a successful/complete check. Keep coverage and
+        # detector execution state alongside the Phase 2 canonical score.
+        result["result_statuses"] = build_analysis_statuses(result)
+
          # -------------------------------------
         # BASIC INFORMATION
         # -------------------------------------
@@ -3498,14 +3662,15 @@ async def _analyze_email(
                 result,
         }
 
+    except HTTPException:
+        raise
+
     except Exception as error:
+        api_logger.error("email_analysis_failed error_type=%s", type(error).__name__)
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Email analysis failed: "
-                + str(error)
-            ),
+            detail="Email analysis could not be completed. Retry or contact an administrator with the request ID.",
         )
 
 
@@ -3603,13 +3768,7 @@ def get_evidence_record(
     except HTTPException:
         raise
     except Exception as error:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Evidence lookup failed: "
-                + str(error)
-            ),
-        )
+        raise HTTPException(status_code=404, detail="Evidence not found.")
 
 
 @app.get("/api/evidence/{evidence_id}/integrity")
@@ -3665,13 +3824,7 @@ def verify_evidence_integrity(
     except HTTPException:
         raise
     except Exception as error:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Evidence integrity verification failed: "
-                + str(error)
-            ),
-        )
+        raise HTTPException(status_code=404, detail="Evidence not found.")
 
 
 @app.post("/api/privacy/redact")
@@ -3990,11 +4143,3 @@ if __name__ == "__main__":
         port=8000,
         reload=True
     )
-
-
-
-
-
-
-
-

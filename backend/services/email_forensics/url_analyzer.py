@@ -1,20 +1,15 @@
 ﻿from __future__ import annotations
 
 import ipaddress
-import re
 from typing import Any
 from urllib.parse import urlparse
+
+from services.url_extraction import extract_url_evidence
 
 
 # =========================================================
 # URL FORENSICS ANALYZER
 # =========================================================
-
-URL_PATTERN = re.compile(
-    r"https?://[^\s<>\"']+",
-    re.IGNORECASE
-)
-
 
 SUSPICIOUS_TLDS = {
     "tk", "ml", "ga", "cf", "gq",
@@ -376,24 +371,8 @@ def _analyse_url(
     # BRAND INDICATORS
     # ---------------------------------------------------------
 
-    if brand_indicators:
-
-        score += 25
-
-        findings.append({
-            "type": "brand",
-            "severity": "MEDIUM",
-            "title": "Known brand indicator detected",
-            "description": (
-                "The destination domain contains a known brand "
-                "name and may require impersonation analysis."
-            ),
-            "matches": brand_indicators
-        })
-
-        reasons.append(
-            "Domain contains a known brand name."
-        )
+    # Keep brand-name matches as context only. A genuine brand hostname or
+    # incidental substring is not evidence of impersonation by itself.
 
     # ---------------------------------------------------------
     # LONG URL
@@ -490,7 +469,7 @@ def _analyse_url(
 
 
 def analyze_urls(
-    text: str
+    text: str | list[str]
 ) -> dict[str, Any]:
 
     """
@@ -511,10 +490,11 @@ def analyze_urls(
             "finding_count": 0
         }
 
-    extracted = [
-        _clean_url(match.group(0))
-        for match in URL_PATTERN.finditer(text)
-    ]
+    extracted = (
+        [str(value) for value in text]
+        if isinstance(text, list)
+        else [item["comparison_url"] for item in extract_url_evidence([(0, text)], [])]
+    )
 
     urls = list(
         dict.fromkeys(
@@ -568,4 +548,3 @@ def analyze_urls(
         "findings": findings,
         "finding_count": len(findings)
     }
-

@@ -267,12 +267,16 @@ with lock:
     print("LOCK_HELD", flush=True)
     time.sleep(1.5)
 """
+        # Use the backend package root, not the caller's working directory.
+        # This keeps the cross-process lock test reproducible from repository root
+        # as well as from backend/.
+        backend_root = Path(__file__).resolve().parents[3]
         proc = subprocess.Popen(
             [sys.executable, "-c", code],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=str(Path.cwd()),
+            cwd=str(backend_root),
         )
         line = proc.stdout.readline().strip()
         assert line == "LOCK_HELD"

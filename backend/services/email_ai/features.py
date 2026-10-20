@@ -1610,12 +1610,13 @@ def _detect_typosquatting(
         Dict[str, Any]
     ] = []
 
-    root = _domain_root(
-        domain
-    )
-
-    if not root:
+    registrable_domain = _domain_root(domain)
+    if not registrable_domain:
         return findings
+
+    # Compare the registrable label to candidate brand labels. Including the
+    # public suffix in the distance makes real one-character typos disappear.
+    root = registrable_domain.split(".", 1)[0]
 
     normalized_root = (
         _normalize_identity_text(root)
@@ -1852,10 +1853,32 @@ def analyze_identity_intelligence(
         if domains_differ(sender_domain, reply_domain):
             risk_score += 20
 
-    if typosquatting:
+    corroborated_sender_typosquatting = [
+        finding
+        for finding in typosquatting
+        if finding.get("brand") in claimed_brands
+    ]
+    corroborated_reply_typosquatting = [
+        finding
+        for finding in reply_typosquatting
+        if finding.get("brand") in claimed_brands
+    ]
+
+    # Similarity remains visible for analyst review, but it contributes to
+    # risk only when the message itself claims the compared brand.
+    for finding in typosquatting:
+        finding["corroborated_by_display_name"] = (
+            finding.get("brand") in claimed_brands
+        )
+    for finding in reply_typosquatting:
+        finding["corroborated_by_display_name"] = (
+            finding.get("brand") in claimed_brands
+        )
+
+    if corroborated_sender_typosquatting:
         risk_score += 30
 
-    if reply_typosquatting:
+    if corroborated_reply_typosquatting:
         risk_score += 20
 
     risk_score = min(
@@ -3856,5 +3879,3 @@ def reconstruct_attack_chain(
         ),
 
     }
-
-

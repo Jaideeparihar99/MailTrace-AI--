@@ -1,17 +1,24 @@
-﻿import json
+import json
 import os
 import time
+from datetime import datetime, timezone
 import urllib.parse
 import urllib.request
 import urllib.error
 
 from ..models import ProviderResult
+from services.ip_address_policy import require_public_ip
 
 
 def query_ipapi_network(ip: str) -> ProviderResult:
 
     started = time.perf_counter()
-
+    safe_ip, policy = require_public_ip(ip)
+    if safe_ip is None:
+        return ProviderResult(provider="ipapi_network", success=False,
+            error=f"NOT_APPLICABLE: NOT_PUBLIC ({policy['classification']}).", latency_ms=0)
+    ip = safe_ip
+    queried_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     url = (
         f"https://ipapi.co/"
         f"{urllib.parse.quote(ip)}/json/"
@@ -40,6 +47,7 @@ def query_ipapi_network(ip: str) -> ProviderResult:
             return ProviderResult(
                 provider="ipapi_network",
                 success=False,
+                data={"status": "PROVIDER_ERROR", "source": "ipapi.co", "lookup_timestamp": queried_at, "ip": ip},
                 error=data.get(
                     "reason",
                     "Network intelligence lookup failed."
@@ -54,10 +62,13 @@ def query_ipapi_network(ip: str) -> ProviderResult:
             provider="ipapi_network",
             success=True,
             data={
+                "status": "AVAILABLE",
                 "asn": data.get("asn"),
                 "organization": data.get("org"),
                 "network": data.get("network"),
                 "version": data.get("version"),
+                "source": "ipapi.co",
+                "lookup_timestamp": queried_at,
             },
             latency_ms=round(
                 (time.perf_counter() - started) * 1000,
@@ -70,6 +81,7 @@ def query_ipapi_network(ip: str) -> ProviderResult:
         return ProviderResult(
             provider="ipapi_network",
             success=False,
+            data={"status": "PROVIDER_ERROR", "source": "ipapi.co", "lookup_timestamp": queried_at, "ip": ip},
             error=f"HTTP {error.code}: {error.reason}",
             latency_ms=round(
                 (time.perf_counter() - started) * 1000,
@@ -82,6 +94,7 @@ def query_ipapi_network(ip: str) -> ProviderResult:
         return ProviderResult(
             provider="ipapi_network",
             success=False,
+            data={"status": "PROVIDER_ERROR", "source": "ipapi.co", "lookup_timestamp": queried_at, "ip": ip},
             error=str(error),
             latency_ms=round(
                 (time.perf_counter() - started) * 1000,
@@ -95,49 +108,15 @@ def classify_network(
     hostname: str | None,
     asn: str | None
 ) -> dict:
-
-    text = " ".join(
-        value.lower()
-        for value in (
-            organization,
-            hostname,
-            asn
-        )
-        if value
-    )
-
-    hosting_keywords = (
-        "amazon",
-        "aws",
-        "google cloud",
-        "google llc",
-        "microsoft",
-        "azure",
-        "digitalocean",
-        "linode",
-        "vultr",
-        "ovh",
-        "hetzner",
-        "oracle cloud",
-        "cloudflare",
-        "data center",
-        "datacenter",
-        "hosting",
-        "host"
-    )
-
-    hosting_matches = [
-        keyword
-        for keyword in hosting_keywords
-        if keyword in text
-    ]
-
     return {
-        "hosting_signal": bool(hosting_matches),
-        "hosting_matches": hosting_matches,
-        "classification": (
-            "cloud_or_hosting_infrastructure"
-            if hosting_matches
-            else "unknown_network_type"
-        )
+        "hosting_signal": None,
+        "hosting_matches": [],
+        "classification": "UNKNOWN",
+        "status": "NOT_ASSESSED",
+        "reason": "ASN, organization, hostname, and geolocation are contextual metadata; no configured provider result independently classifies hosting, VPN, proxy, or Tor status.",
+        "observed_network_metadata": {
+            "organization": organization,
+            "hostname": hostname,
+            "asn": asn,
+        },
     }
